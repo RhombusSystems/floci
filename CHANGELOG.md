@@ -1,3 +1,25 @@
+# [1.5.0](https://github.com/floci-io/floci/compare/1.4.0...1.5.0) (2026-04-09)
+
+
+### Bug Fixes
+
+* append march x86-64-v2 ([#303](https://github.com/floci-io/floci/issues/303)) ([ddccbe0](https://github.com/floci-io/floci/commit/ddccbe067a22d415b0b52d65bee5d1293087d4e6))
+* DynamoDB DescribeTable returns Projection.NonKeyAttributes ([#300](https://github.com/floci-io/floci/issues/300)) ([552e71e](https://github.com/floci-io/floci/commit/552e71e76f19bc31b7ee40fd084441a10d6294ca))
+* implement missing RDS resource identifiers and fix filtering ([#231](https://github.com/floci-io/floci/issues/231)) ([#302](https://github.com/floci-io/floci/issues/302)) ([7af3600](https://github.com/floci-io/floci/commit/7af3600bcaa4652ad57ceebe211ad3ba0e336adb))
+* Implement S3 Lambda notifications ([#278](https://github.com/floci-io/floci/issues/278)) ([04cbeb5](https://github.com/floci-io/floci/commit/04cbeb542f377b46cd3b84806628c14ab68cada2))
+* implement SRP-6a authentication for Cognito ([#284](https://github.com/floci-io/floci/issues/284)) ([#298](https://github.com/floci-io/floci/issues/298)) ([7c6e6a6](https://github.com/floci-io/floci/commit/7c6e6a6dfaa5fc73ebfa41a17ab40f506baba3c6))
+* merge branch 'main' into release/1.x ([f32f4a9](https://github.com/floci-io/floci/commit/f32f4a97a7e2cdcf5186b8e525efbd7a2df9c3e7))
+* register Xerces XML resource bundles for native image ([#293](https://github.com/floci-io/floci/issues/293)) ([#296](https://github.com/floci-io/floci/issues/296)) ([0bad933](https://github.com/floci-io/floci/commit/0bad9338f9269fc9ddf4e2f01bc71dda6ca418b9))
+* **s3:** use case-insensitive field lookup for presigned POST policy validation ([#289](https://github.com/floci-io/floci/issues/289)) ([3d2cc1c](https://github.com/floci-io/floci/commit/3d2cc1c95e5a39b8006a5a92366bc5dc22842bb0))
+* **s3:** use ConfigProvider for runtime config lookup in S3VirtualHostFilter ([#288](https://github.com/floci-io/floci/issues/288)) ([944fddf](https://github.com/floci-io/floci/commit/944fddf5acb8f9fa394550f5a4f088f0ef6ad3ee))
+
+
+### Features
+
+* **cloudformation:** add AWS::Events::Rule provisioning support ([#261](https://github.com/floci-io/floci/issues/261)) ([c475e52](https://github.com/floci-io/floci/commit/c475e529845d413c23ec70165789864d013463e7))
+* **eventbridge:** add InputTransformer support and S3 event notifications ([#294](https://github.com/floci-io/floci/issues/294)) ([9ca82e5](https://github.com/floci-io/floci/commit/9ca82e5748cb700760aca3efd3c34a06a5766ec2)), closes [#140](https://github.com/floci-io/floci/issues/140)
+* load persisted dynamodb streams on start up ([#299](https://github.com/floci-io/floci/issues/299)) ([ae49bfb](https://github.com/floci-io/floci/commit/ae49bfb378b00c251b5d952ba16d81e892f364bd))
+
 # [1.4.0](https://github.com/floci-io/floci/compare/1.3.0...1.4.0) (2026-04-08)
 
 
