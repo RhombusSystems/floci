@@ -95,3 +95,10 @@ setup() {
     assert_success
     assert_output --partial "floci-compat"
 }
+
+@test "Terraform: RDS DB instance created and available" {
+    run aws_cmd rds describe-db-instances --db-instance-identifier floci-compat-db
+    assert_success
+    assert_output --partial "floci-compat-db"
+    assert_output --partial "available"
+}

@@ -35,5 +35,6 @@ provider "aws" {
     ssm            = var.endpoint
     secretsmanager = var.endpoint
     cognitoidp     = var.endpoint
+    rds            = var.endpoint
   }
 }
