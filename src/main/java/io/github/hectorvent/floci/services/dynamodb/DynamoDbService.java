@@ -234,6 +234,10 @@ public class DynamoDbService {
         JsonNode existing = tableItems.get(itemKey);
 
         if (conditionExpression != null) {
+            LOG.infov("PutItem CONDITIONAL: table={0}, key={1}, existing={2}, condition={3}, exprNames={4}, exprValues={5}",
+                tableName, itemKey, existing != null, conditionExpression,
+                exprAttrNames != null ? exprAttrNames.toString() : "null",
+                exprAttrValues != null ? exprAttrValues.toString() : "null");
             evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues);
         }
 
@@ -359,8 +363,10 @@ public class DynamoDbService {
                     case "PUT" -> { if (value != null) item.set(attrName, value); }
                     case "DELETE" -> item.remove(attrName);
                     case "ADD" -> {
-                        // Simple ADD for numeric values
-                        if (value != null) item.set(attrName, value);
+                        if (value != null) {
+                            JsonNode existingAttr = item.get(attrName);
+                            item.set(attrName, applyAddOperation(existingAttr, value));
+                        }
                     }
                 }
             }
@@ -866,7 +872,10 @@ public class DynamoDbService {
 
     private void evaluateCondition(JsonNode existingItem, String conditionExpression,
                                     JsonNode exprAttrNames, JsonNode exprAttrValues) {
-        if (!matchesFilterExpression(existingItem, conditionExpression, exprAttrNames, exprAttrValues)) {
+        boolean matches = matchesFilterExpression(existingItem, conditionExpression, exprAttrNames, exprAttrValues);
+        LOG.infov("evaluateCondition: expression={0}, existingItem={1}, result={2}",
+            conditionExpression, existingItem != null ? "EXISTS" : "NULL", matches);
+        if (!matches) {
             throw new AwsException("ConditionalCheckFailedException",
                     "The conditional request failed", 400);
         }
@@ -1313,15 +1322,56 @@ public class DynamoDbService {
     private boolean matchesFilterExpression(JsonNode item, String filterExpression,
                                              JsonNode exprAttrNames, JsonNode exprAttrValues) {
         filterExpression = trimBalancedOuterParens(filterExpression);
-        // Handle AND/OR combined expressions
-        // Split on AND first (simple approach — handles most common cases)
-        String[] andParts = filterExpression.split("\\s+[Aa][Nn][Dd]\\s+");
-        for (String part : andParts) {
-            if (!evaluateSingleCondition(item, part.trim(), exprAttrNames, exprAttrValues)) {
-                return false;
+        // Handle OR first: split on OR, then each OR-branch is split on AND.
+        // OR has lower precedence than AND in DynamoDB condition expressions.
+        String[] orParts = splitTopLevel(filterExpression, "OR");
+        for (String orPart : orParts) {
+            String[] andParts = splitTopLevel(orPart.trim(), "AND");
+            boolean allAndTrue = true;
+            for (String andPart : andParts) {
+                if (!evaluateSingleCondition(item, andPart.trim(), exprAttrNames, exprAttrValues)) {
+                    allAndTrue = false;
+                    break;
+                }
+            }
+            if (allAndTrue) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Splits a filter expression on a keyword (AND/OR) while respecting parenthesized groups.
+     * Tokens inside parentheses are not split on.
+     */
+    private String[] splitTopLevel(String expr, String keyword) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        String upper = expr.toUpperCase();
+        String padded = " " + keyword.toUpperCase() + " ";
+        String upperPadded = " " + upper;  // pad so we can match leading space at pos 0
+        for (int i = 0; i < expr.length(); i++) {
+            char c = expr.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (depth == 0) {
+                // Check if we're at a top-level keyword boundary
+                // We need whitespace before and after the keyword
+                if (i > 0 && Character.isWhitespace(expr.charAt(i - 1))) {
+                    String remaining = upper.substring(i);
+                    if (remaining.startsWith(keyword.toUpperCase())) {
+                        int afterKeyword = i + keyword.length();
+                        if (afterKeyword < expr.length() && Character.isWhitespace(expr.charAt(afterKeyword))) {
+                            parts.add(expr.substring(start, i - 1).trim());
+                            start = afterKeyword + 1;
+                            i = afterKeyword; // skip past keyword
+                        }
+                    }
+                }
             }
         }
-        return true;
+        parts.add(expr.substring(start).trim());
+        return parts.toArray(new String[0]);
     }
 
     private boolean evaluateSingleCondition(JsonNode item, String condition,
@@ -1332,6 +1382,19 @@ public class DynamoDbService {
         //        "begins_with(attrPath, :val)", "contains(attrPath, :val)"
         String condLower = condition.toLowerCase();
 
+        if (condLower.startsWith("attribute_type")) {
+            String[] args = extractFunctionArgs(condition);
+            if (args.length == 2) {
+                String attrPath = resolveAttributePath(args[0].trim(), exprAttrNames);
+                String expectedType = resolveExprValue(args[1].trim(), exprAttrValues);
+                if (item == null) return false;
+                JsonNode attrValue = resolveNestedAttribute(item, attrPath);
+                if (attrValue == null) return false;
+                // DynamoDB types: S, N, B, BOOL, NULL, L, M, SS, NS, BS
+                return attrValue.has(expectedType);
+            }
+            return false;
+        }
         if (condLower.startsWith("attribute_exists")) {
             String attr = extractFunctionArg(condition);
             String resolvedPath = resolveAttributePath(attr, exprAttrNames);

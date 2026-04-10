@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.acm.AcmJsonHandler;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2JsonHandler;
@@ -43,6 +44,7 @@ public class AwsJson11Controller {
     private static final String COGNITO_TARGET_PREFIX = "AWSCognitoIdentityProviderService.";
     private static final String ACM_TARGET_PREFIX = "CertificateManager.";
     private static final String ECS_TARGET_PREFIX = "AmazonEC2ContainerServiceV20141113.";
+    private static final String REKOGNITION_TARGET_PREFIX = "RekognitionService.";
 
     private final ObjectMapper objectMapper;
     private final RegionResolver regionResolver;
@@ -125,6 +127,9 @@ public class AwsJson11Controller {
         } else if (target.startsWith(ECS_TARGET_PREFIX)) {
             prefix = ECS_TARGET_PREFIX;
             serviceName = "ECS";
+        } else if (target.startsWith(REKOGNITION_TARGET_PREFIX)) {
+            prefix = REKOGNITION_TARGET_PREFIX;
+            serviceName = "Rekognition";
         } else {
             return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
         }
@@ -147,6 +152,7 @@ public class AwsJson11Controller {
                 case "Cognito" -> cognitoJsonHandler.handle(action, request, region);
                 case "ACM" -> acmJsonHandler.handle(action, request, region);
                 case "ECS" -> ecsJsonHandler.handle(action, request, region);
+                case "Rekognition" -> handleRekognitionStub(action, request);
                 default -> null;
             };
         } catch (AwsException e) {
@@ -155,6 +161,29 @@ public class AwsJson11Controller {
             LOG.errorf("Error processing %s request", serviceName, e);
             return JsonErrorResponseUtils.createErrorResponse(e);
         }
+    }
+
+    /**
+     * Stub handler for Rekognition operations. Returns minimal success responses.
+     */
+    private Response handleRekognitionStub(String action, JsonNode request) {
+        ObjectNode response = objectMapper.createObjectNode();
+        switch (action) {
+            case "CreateCollection" -> {
+                response.put("StatusCode", 200);
+                String collectionArn = "arn:aws:rekognition:us-west-2:000000000000:collection/"
+                        + request.path("CollectionId").asText("unknown");
+                response.put("CollectionArn", collectionArn);
+                response.put("FaceModelVersion", "7.0");
+            }
+            case "DeleteCollection" -> response.put("StatusCode", 200);
+            case "ListCollections" -> {
+                response.set("CollectionIds", objectMapper.createArrayNode());
+                response.set("FaceModelVersions", objectMapper.createArrayNode());
+            }
+            default -> LOG.warnv("Rekognition stub: unhandled action {0}", action);
+        }
+        return Response.ok(response).build();
     }
 
 }

@@ -32,6 +32,23 @@ public class DynamoDbJsonHandler {
         this.objectMapper = objectMapper;
     }
 
+    /**
+     * Builds a ConsumedCapacity node if the request asks for it via ReturnConsumedCapacity.
+     * Returns null if not requested (i.e. NONE or absent).
+     */
+    private ObjectNode buildConsumedCapacity(JsonNode request) {
+        String rcc = request.has("ReturnConsumedCapacity")
+                ? request.get("ReturnConsumedCapacity").asText("NONE") : "NONE";
+        if ("NONE".equals(rcc)) return null;
+        ObjectNode cc = objectMapper.createObjectNode();
+        cc.put("TableName", request.path("TableName").asText());
+        cc.put("CapacityUnits", 1.0);
+        ObjectNode table = objectMapper.createObjectNode();
+        table.put("CapacityUnits", 1.0);
+        cc.set("Table", table);
+        return cc;
+    }
+
     public Response handle(String action, JsonNode request, String region) throws Exception {
         return switch (action) {
             case "CreateTable" -> handleCreateTable(request, region);
@@ -217,6 +234,8 @@ public class DynamoDbJsonHandler {
         if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
             response.set("Attributes", oldItem);
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
@@ -230,6 +249,8 @@ public class DynamoDbJsonHandler {
         if (item != null) {
             response.set("Item", item);
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
@@ -251,6 +272,8 @@ public class DynamoDbJsonHandler {
         if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
             response.set("Attributes", oldItem);
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
@@ -280,6 +303,8 @@ public class DynamoDbJsonHandler {
         } else if ("ALL_OLD" .equals(returnValues) && result.oldItem() != null) {
             response.set("Attributes", result.oldItem());
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
@@ -314,6 +339,8 @@ public class DynamoDbJsonHandler {
         if (result.lastEvaluatedKey() != null) {
             response.set("LastEvaluatedKey", result.lastEvaluatedKey());
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
@@ -343,6 +370,8 @@ public class DynamoDbJsonHandler {
         if (result.lastEvaluatedKey() != null) {
             response.set("LastEvaluatedKey", result.lastEvaluatedKey());
         }
+        ObjectNode cc = buildConsumedCapacity(request);
+        if (cc != null) response.set("ConsumedCapacity", cc);
         return Response.ok(response).build();
     }
 
