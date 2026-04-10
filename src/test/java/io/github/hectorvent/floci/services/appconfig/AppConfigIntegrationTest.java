@@ -35,8 +35,8 @@ class AppConfigIntegrationTest {
                 .when().post("/applications")
                 .then()
                 .statusCode(201)
-                .body("name", equalTo("test-app"))
-                .extract().path("id");
+                .body("Name", equalTo("test-app"))
+                .extract().path("Id");
     }
 
     @Test @Order(2)
@@ -47,8 +47,8 @@ class AppConfigIntegrationTest {
                 .when().post("/applications/" + appId + "/environments")
                 .then()
                 .statusCode(201)
-                .body("name", equalTo("test-env"))
-                .extract().path("id");
+                .body("Name", equalTo("test-env"))
+                .extract().path("Id");
     }
 
     @Test @Order(3)
@@ -59,8 +59,8 @@ class AppConfigIntegrationTest {
                 .when().post("/applications/" + appId + "/configurationprofiles")
                 .then()
                 .statusCode(201)
-                .body("name", equalTo("test-profile"))
-                .extract().path("id");
+                .body("Name", equalTo("test-profile"))
+                .extract().path("Id");
     }
 
     @Test @Order(4)
@@ -72,7 +72,7 @@ class AppConfigIntegrationTest {
                 .when().post("/applications/" + appId + "/configurationprofiles/" + profileId + "/hostedconfigurationversions")
                 .then()
                 .statusCode(201)
-                .body("VersionNumber", equalTo(1));
+                .header("Version-Number", equalTo("1"));
     }
 
     @Test @Order(5)
@@ -83,8 +83,8 @@ class AppConfigIntegrationTest {
                 .when().post("/deploymentstrategies")
                 .then()
                 .statusCode(201)
-                .body("name", equalTo("immediate"))
-                .extract().path("id");
+                .body("Name", equalTo("immediate"))
+                .extract().path("Id");
     }
 
     @Test @Order(6)
@@ -95,7 +95,7 @@ class AppConfigIntegrationTest {
                 .when().post("/applications/" + appId + "/environments/" + envId + "/deployments")
                 .then()
                 .statusCode(201)
-                .body("state", equalTo("COMPLETE"));
+                .body("State", equalTo("COMPLETE"));
     }
 
     @Test @Order(7)
@@ -118,8 +118,8 @@ class AppConfigIntegrationTest {
                 .then()
                 .statusCode(200)
                 .header("Content-Type", startsWith("application/json"))
-                .header("X-Amz-AppConfig-Configuration-Version", equalTo("1"))
-                .header("X-Amz-AppConfig-Next-Poll-Configuration-Token", notNullValue())
+                .header("Version-Label", equalTo("1"))
+                .header("Next-Poll-Configuration-Token", notNullValue())
                 .body("foo", equalTo("bar"));
     }
 }
