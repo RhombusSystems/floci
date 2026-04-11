@@ -347,7 +347,18 @@ public class DynamoDbService {
 
         // Apply UpdateExpression (modern format: "SET #n = :val, age = :age REMOVE attr")
         if (updateExpression != null) {
+            if (tableName.contains("KConsumer") || tableName.contains("kconsumer")) {
+                System.out.println("FLOCI_DEBUG UpdateItem table=" + tableName
+                    + " expr=" + updateExpression
+                    + " names=" + (expressionAttrNames != null ? expressionAttrNames.toString() : "null")
+                    + " values=" + (expressionAttrValues != null ? expressionAttrValues.toString() : "null")
+                    + " itemBefore=" + item.toString().substring(0, Math.min(200, item.toString().length())));
+            }
             applyUpdateExpression(item, updateExpression, expressionAttrNames, expressionAttrValues);
+            if (tableName.contains("KConsumer") || tableName.contains("kconsumer")) {
+                System.out.println("FLOCI_DEBUG UpdateItem AFTER table=" + tableName
+                    + " itemAfter=" + item.toString().substring(0, Math.min(300, item.toString().length())));
+            }
         }
         // Apply attribute updates (legacy format: AttributeUpdates)
         else if (attributeUpdates != null && attributeUpdates.isObject()) {

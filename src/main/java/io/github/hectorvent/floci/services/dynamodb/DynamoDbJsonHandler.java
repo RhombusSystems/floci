@@ -49,7 +49,14 @@ public class DynamoDbJsonHandler {
         return cc;
     }
 
+    private static final org.jboss.logging.Logger LOG = org.jboss.logging.Logger.getLogger(DynamoDbJsonHandler.class);
+
     public Response handle(String action, JsonNode request, String region) throws Exception {
+        String tableName = request.has("TableName") ? request.path("TableName").asText() : "";
+        if (tableName.contains("KConsumer") && ("UpdateItem".equals(action) || "PutItem".equals(action) || "Scan".equals(action))) {
+            LOG.infov("FLOCI_KCL {0} table={1} body={2}", action, tableName,
+                request.toString().substring(0, Math.min(500, request.toString().length())));
+        }
         return switch (action) {
             case "CreateTable" -> handleCreateTable(request, region);
             case "DeleteTable" -> handleDeleteTable(request, region);
@@ -222,6 +229,35 @@ public class DynamoDbJsonHandler {
         JsonNode exprAttrValues = request.has("ExpressionAttributeValues")
                 ? request.get("ExpressionAttributeValues") : null;
 
+        // Convert legacy Expected to ConditionExpression
+        if (conditionExpression == null && request.has("Expected")) {
+            JsonNode expected = request.get("Expected");
+            StringBuilder condBuilder = new StringBuilder();
+            int idx = 0;
+            var fields = expected.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                String attrName = entry.getKey();
+                JsonNode condition = entry.getValue();
+                if (idx > 0) condBuilder.append(" AND ");
+                if (condition.has("Exists") && !condition.get("Exists").asBoolean()) {
+                    condBuilder.append("attribute_not_exists(").append(attrName).append(")");
+                } else if (condition.has("ComparisonOperator")) {
+                    // NOT_NULL, NULL, etc
+                    String op = condition.get("ComparisonOperator").asText();
+                    if ("NOT_NULL".equals(op)) condBuilder.append("attribute_exists(").append(attrName).append(")");
+                    else if ("NULL".equals(op)) condBuilder.append("attribute_not_exists(").append(attrName).append(")");
+                } else if (condition.has("Value")) {
+                    String placeholder = ":_expected" + idx;
+                    condBuilder.append(attrName).append(" = ").append(placeholder);
+                    if (exprAttrValues == null) exprAttrValues = objectMapper.createObjectNode();
+                    ((ObjectNode) exprAttrValues).set(placeholder, condition.get("Value"));
+                }
+                idx++;
+            }
+            if (condBuilder.length() > 0) conditionExpression = condBuilder.toString();
+        }
+
         JsonNode oldItem = null;
         if ("ALL_OLD" .equals(returnValues)) {
             dynamoDbService.describeTable(tableName, region);
@@ -289,6 +325,43 @@ public class DynamoDbJsonHandler {
                 ? request.get("UpdateExpression").asText() : null;
         String conditionExpression = request.has("ConditionExpression")
                 ? request.get("ConditionExpression").asText() : null;
+
+        // Convert legacy Expected to ConditionExpression if present
+        if (conditionExpression == null && request.has("Expected")) {
+            JsonNode expected = request.get("Expected");
+            StringBuilder condBuilder = new StringBuilder();
+            ObjectNode syntheticAttrValues = objectMapper.createObjectNode();
+            int idx = 0;
+            var fields = expected.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                String attrName = entry.getKey();
+                JsonNode condition = entry.getValue();
+                if (idx > 0) condBuilder.append(" AND ");
+                if (condition.has("Exists") && !condition.get("Exists").asBoolean()) {
+                    condBuilder.append("attribute_not_exists(").append(attrName).append(")");
+                } else if (condition.has("Value")) {
+                    String placeholder = ":_expected" + idx;
+                    condBuilder.append(attrName).append(" = ").append(placeholder);
+                    syntheticAttrValues.set(placeholder, condition.get("Value"));
+                }
+                idx++;
+            }
+            if (condBuilder.length() > 0) {
+                conditionExpression = condBuilder.toString();
+                if (exprAttrValues == null) {
+                    exprAttrValues = syntheticAttrValues;
+                } else {
+                    // merge
+                    var mergedFields = syntheticAttrValues.fields();
+                    while (mergedFields.hasNext()) {
+                        var e = mergedFields.next();
+                        ((ObjectNode) exprAttrValues).set(e.getKey(), e.getValue());
+                    }
+                }
+            }
+        }
+
         String returnValues = request.path("ReturnValues").asText("NONE");
 
         JsonNode updateData = attributeUpdates.isMissingNode() ? null : attributeUpdates;
