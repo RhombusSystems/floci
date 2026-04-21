@@ -8,6 +8,7 @@ import org.jboss.logging.Logger;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -24,6 +25,12 @@ public class StorageFactory {
     private final List<StorageBackend<?, ?>> allBackends = new ArrayList<>();
     private final List<HybridStorage<?, ?>> hybridBackends = new ArrayList<>();
     private final List<WalStorage<?, ?>> walBackends = new ArrayList<>();
+    // One backend per persistent file. Multiple services that share a file
+    // (e.g., DynamoDbService + DynamoDbStreamService both read dynamodb-tables.json)
+    // must share a single in-memory store — otherwise each backend's flush()
+    // writes its own independent state to the same file and the last writer
+    // wins, clobbering the other service's updates.
+    private final Map<Path, StorageBackend<?, ?>> backendsByPath = new HashMap<>();
 
     @Inject
     public StorageFactory(EmulatorConfig config) {
@@ -37,12 +44,21 @@ public class StorageFactory {
      * @param fileName      the JSON file name for persistent storage
      * @param typeReference Jackson type reference for deserialization
      */
+    @SuppressWarnings("unchecked")
     public <K, V> StorageBackend<K, V> create(String serviceName, String fileName,
                                                TypeReference<Map<K, V>> typeReference) {
         String mode = resolveMode(serviceName);
         long flushInterval = resolveFlushInterval(serviceName);
         Path basePath = Path.of(config.storage().persistentPath());
         Path filePath = basePath.resolve(fileName);
+
+        // If a backend was already created for this file, return it. Callers
+        // passing compatible type references share the same in-memory store.
+        StorageBackend<K, V> existing = (StorageBackend<K, V>) backendsByPath.get(filePath);
+        if (existing != null) {
+            LOG.infov("Reusing {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
+            return existing;
+        }
 
         LOG.infov("Creating {0} storage for service {1} (file: {2})", mode, serviceName, filePath);
 
@@ -69,6 +85,7 @@ public class StorageFactory {
         backend.load();
 
         allBackends.add(backend);
+        backendsByPath.put(filePath, backend);
         return backend;
     }
 
