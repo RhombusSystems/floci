@@ -392,6 +392,12 @@ public class DynamoDbJsonHandler {
                 ? request.get("KeyConditionExpression").asText() : null;
         String filterExpr = request.has("FilterExpression")
                 ? request.get("FilterExpression").asText() : null;
+        // Legacy QueryFilter parameter — same wire format as ScanFilter, applied
+        // post-key-condition. AWS SDK v1's Document API still emits this when
+        // callers use QuerySpec.withQueryFilters(...). Without honoring it, those
+        // queries return UNFILTERED results, breaking type-discriminated reads.
+        JsonNode queryFilter = request.has("QueryFilter")
+                ? request.get("QueryFilter") : null;
         Integer limit = request.has("Limit") ? request.get("Limit").asInt() : null;
         Boolean scanIndexForward = request.has("ScanIndexForward")
                 ? request.get("ScanIndexForward").asBoolean() : null;
@@ -400,7 +406,7 @@ public class DynamoDbJsonHandler {
                 ? request.get("ExclusiveStartKey") : null;
 
         DynamoDbService.QueryResult result = dynamoDbService.query(tableName, keyConditions,
-                exprAttrValues, keyConditionExpr, filterExpr, limit, scanIndexForward, indexName,
+                exprAttrValues, keyConditionExpr, filterExpr, queryFilter, limit, scanIndexForward, indexName,
                 exclusiveStartKey, exprAttrNames, region);
 
         ObjectNode response = objectMapper.createObjectNode();

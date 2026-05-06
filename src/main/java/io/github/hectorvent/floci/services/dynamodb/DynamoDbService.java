@@ -397,20 +397,28 @@ public class DynamoDbService {
                               JsonNode expressionAttrValues, String keyConditionExpression,
                               String filterExpression, Integer limit) {
         return query(tableName, keyConditions, expressionAttrValues, keyConditionExpression,
-                     filterExpression, limit, null, null, null, null, regionResolver.getDefaultRegion());
+                     filterExpression, null, limit, null, null, null, null, regionResolver.getDefaultRegion());
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
                               JsonNode expressionAttrValues, String keyConditionExpression,
                               String filterExpression, Integer limit, String region) {
         return query(tableName, keyConditions, expressionAttrValues, keyConditionExpression,
-                     filterExpression, limit, null, null, null, null, region);
+                     filterExpression, null, limit, null, null, null, null, region);
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
                               JsonNode expressionAttrValues, String keyConditionExpression,
                               String filterExpression, Integer limit, Boolean scanIndexForward, String indexName,
                               JsonNode exclusiveStartKey, JsonNode exprAttrNames, String region) {
+        return query(tableName, keyConditions, expressionAttrValues, keyConditionExpression,
+                     filterExpression, null, limit, scanIndexForward, indexName, exclusiveStartKey, exprAttrNames, region);
+    }
+
+    public QueryResult query(String tableName, JsonNode keyConditions,
+                              JsonNode expressionAttrValues, String keyConditionExpression,
+                              String filterExpression, JsonNode queryFilter, Integer limit, Boolean scanIndexForward,
+                              String indexName, JsonNode exclusiveStartKey, JsonNode exprAttrNames, String region) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -522,6 +530,15 @@ public class DynamoDbService {
             evaluatedItems = evaluatedItems.stream()
                     .filter(item -> matchesFilterExpression(item, filterExpression,
                             exprAttrNames, expressionAttrValues))
+                    .toList();
+        }
+
+        // Legacy QueryFilter is applied AFTER FilterExpression (same as ScanFilter
+        // is in scan(...)). The wire format is identical to ScanFilter so we share
+        // matchesScanFilter for both.
+        if (queryFilter != null) {
+            evaluatedItems = evaluatedItems.stream()
+                    .filter(item -> matchesScanFilter(item, queryFilter))
                     .toList();
         }
 
