@@ -50,6 +50,7 @@ class EmulatorInfoControllerIntegrationTest {
               "appconfig": "running",
               "appconfigdata": "running",
               "ecr": "running",
+              "rekognition": "running",
               "tagging": "running",
               "bedrock-runtime": "running",
               "eks": "running",
