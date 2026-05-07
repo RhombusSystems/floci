@@ -1,32 +1,35 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.container.PreMatching;
 import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.ext.Provider;
-import org.eclipse.microprofile.config.ConfigProvider;
 
 import java.net.URI;
-import java.util.Optional;
 
 @Provider
 @PreMatching
+@ApplicationScoped
 public class S3VirtualHostFilter implements ContainerRequestFilter {
 
     private final String baseHostname;
 
-    public S3VirtualHostFilter() {
-        var config = ConfigProvider.getConfig();
-        String baseUrl = config
-                .getOptionalValue("floci.base-url", String.class)
-                .orElse("http://localhost:4566");
-        Optional<String> hostname = config
-                .getOptionalValue("floci.hostname", String.class);
-        String effectiveUrl = hostname
-                .map(h -> baseUrl.replaceFirst("://[^:/]+(:\\d+)?", "://" + h + "$1"))
-                .orElse(baseUrl);
-        this.baseHostname = extractHostnameFromUrl(effectiveUrl);
+    @Inject
+    public S3VirtualHostFilter(EmulatorConfig config, ContainerDetector containerDetector) {
+        this.baseHostname = config.hostname()
+                .orElseGet(() -> containerDetector.isRunningInContainer()
+                        ? EmbeddedDnsServer.DEFAULT_SUFFIX
+                        : extractHostnameFromUrl(config.baseUrl()));
+    }
+
+    S3VirtualHostFilter() {
+        this.baseHostname = "localhost";
     }
 
     @Override
@@ -54,6 +57,12 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
 
         URI uri = requestContext.getUriInfo().getRequestUri();
         String path = uri.getRawPath();
+
+        // Do not rewrite S3 Control API paths — the account ID appears as a host label
+        // in the S3ControlClient but the path belongs to the S3 Control service, not S3.
+        if (path.startsWith("/v20180820/")) {
+            return;
+        }
 
         // Rewrite path from /key to /bucket/key
         String newPath = "/" + bucket + (path.startsWith("/") ? "" : "/") + path;
@@ -153,7 +162,7 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
         return true;
     }
 
-    /** Returns true for *.s3.amazonaws.com and *.s3.region.amazonaws.com domains. */
+    /** Returns true for *.s3.amazonaws.com and other well-known S3 domains. */
     private static boolean isAwsS3Domain(String remainder) {
         if ("s3.amazonaws.com".equals(remainder)) {
             return true;
@@ -161,6 +170,11 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
         // s3.<region>.amazonaws.com
         if (remainder.startsWith("s3.") && remainder.endsWith(".amazonaws.com")) {
             return true;
+        }
+        // Support localstack.cloud subdomains (used by cdklocal and other tools)
+        // Example: bucket.s3.localhost.localstack.cloud
+        if (remainder.endsWith(".localstack.cloud")) {
+            return remainder.startsWith("s3.");
         }
         return false;
     }

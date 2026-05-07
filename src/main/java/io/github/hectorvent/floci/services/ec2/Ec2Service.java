@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -19,6 +20,9 @@ public class Ec2Service {
     private static final Logger LOG = Logger.getLogger(Ec2Service.class);
 
     private final String accountId;
+    private final EmulatorConfig config;
+    private final Ec2ContainerManager containerManager;
+    private final AmiImageResolver amiImageResolver;
 
     // region::id → resource
     private final Map<String, Vpc> vpcs = new ConcurrentHashMap<>();
@@ -30,6 +34,7 @@ public class Ec2Service {
     private final Map<String, KeyPair> keyPairs = new ConcurrentHashMap<>();
     private final Map<String, Address> addresses = new ConcurrentHashMap<>();
     private final Map<String, Instance> instances = new ConcurrentHashMap<>();
+    private final Map<String, Volume> volumes = new ConcurrentHashMap<>();
     // resourceId → List<Tag>
     private final Map<String, List<Tag>> tags = new ConcurrentHashMap<>();
     private final Set<String> seededRegions = ConcurrentHashMap.newKeySet();
@@ -37,8 +42,12 @@ public class Ec2Service {
     private final Map<String, AtomicInteger> subnetIpCounters = new ConcurrentHashMap<>();
 
     @Inject
-    public Ec2Service(EmulatorConfig config) {
+    public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+                      AmiImageResolver amiImageResolver) {
         this.accountId = config.defaultAccountId();
+        this.config = config;
+        this.containerManager = containerManager;
+        this.amiImageResolver = amiImageResolver;
     }
 
     // ─── Default resource seeding ──────────────────────────────────────────────
@@ -79,7 +88,7 @@ public class Ec2Service {
             subnet.setMapPublicIpOnLaunch(true);
             subnet.setOwnerId(accountId);
             subnet.setRegion(region);
-            subnet.setSubnetArn("arn:aws:ec2:" + region + ":" + accountId + ":subnet/" + subnetIds[i]);
+            subnet.setSubnetArn(AwsArnUtils.Arn.of("ec2", region, accountId, "subnet/" + subnetIds[i]).toString());
             subnets.put(key(region, subnetIds[i]), subnet);
         }
 
@@ -144,7 +153,8 @@ public class Ec2Service {
     public Reservation runInstances(String region, String imageId, String instanceType,
                                     int minCount, int maxCount, String keyName,
                                     List<String> securityGroupIds, String subnetId,
-                                    String clientToken, List<Tag> instanceTags) {
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn) {
         ensureDefaultResources(region);
 
         // Resolve subnet
@@ -211,6 +221,8 @@ public class Ec2Service {
             inst.setAmiLaunchIndex(i);
             inst.setClientToken(clientToken);
             inst.setRegion(region);
+            inst.setUserData(userData);
+            inst.setIamInstanceProfileArn(iamInstanceProfileArn);
             if (instanceTags != null && !instanceTags.isEmpty()) {
                 inst.setTags(new ArrayList<>(instanceTags));
                 tags.put(instanceId, new ArrayList<>(instanceTags));
@@ -229,6 +241,18 @@ public class Ec2Service {
 
             instances.put(key(region, instanceId), inst);
             reservation.getInstances().add(inst);
+
+            if (!config.services().ec2().mock()) {
+                String dockerImage = amiImageResolver.resolve(imageId);
+                String publicKey = null;
+                if (keyName != null) {
+                    KeyPair kp = findKeyPair(region, keyName);
+                    if (kp != null) {
+                        publicKey = kp.getPublicKey();
+                    }
+                }
+                containerManager.launch(inst, dockerImage, publicKey, region);
+            }
         }
 
         return reservation;
@@ -288,13 +312,18 @@ public class Ec2Service {
                 throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
             }
             InstanceState prev = inst.getState();
-            inst.setState(InstanceState.terminated());
+            if (config.services().ec2().mock()) {
+                inst.setState(InstanceState.terminated());
+                inst.setTerminatedAt(System.currentTimeMillis());
+            } else {
+                containerManager.terminate(inst);
+            }
             Map<String, String> entry = new LinkedHashMap<>();
             entry.put("instanceId", id);
             entry.put("previousState", prev.getName());
             entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "terminated");
-            entry.put("currentCode", "48");
+            entry.put("currentState", "shutting-down");
+            entry.put("currentCode", "32");
             result.add(entry);
         }
         return result;
@@ -309,13 +338,17 @@ public class Ec2Service {
                 throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
             }
             InstanceState prev = inst.getState();
-            inst.setState(InstanceState.stopped());
+            if (config.services().ec2().mock()) {
+                inst.setState(InstanceState.stopped());
+            } else {
+                containerManager.stop(inst);
+            }
             Map<String, String> entry = new LinkedHashMap<>();
             entry.put("instanceId", id);
             entry.put("previousState", prev.getName());
             entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "stopped");
-            entry.put("currentCode", "80");
+            entry.put("currentState", "stopping");
+            entry.put("currentCode", "64");
             result.add(entry);
         }
         return result;
@@ -329,14 +362,22 @@ public class Ec2Service {
             if (inst == null) {
                 throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
             }
+            if ("terminated".equals(inst.getState().getName())) {
+                throw new AwsException("IncorrectInstanceState",
+                        "The instance '" + id + "' is not in a state from which it can be started.", 400);
+            }
             InstanceState prev = inst.getState();
-            inst.setState(InstanceState.running());
+            if (config.services().ec2().mock()) {
+                inst.setState(InstanceState.running());
+            } else {
+                containerManager.start(inst);
+            }
             Map<String, String> entry = new LinkedHashMap<>();
             entry.put("instanceId", id);
             entry.put("previousState", prev.getName());
             entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "running");
-            entry.put("currentCode", "16");
+            entry.put("currentState", "pending");
+            entry.put("currentCode", "0");
             result.add(entry);
         }
         return result;
@@ -349,8 +390,21 @@ public class Ec2Service {
             if (inst == null) {
                 throw new AwsException("InvalidInstanceID.NotFound", "The instance ID '" + id + "' does not exist", 400);
             }
-            // no-op in mock mode
+            if (!config.services().ec2().mock()) {
+                containerManager.reboot(inst);
+            }
         }
+    }
+
+    /** Removes terminated instances older than 1 hour. Called periodically by lifecycle. */
+    public void pruneTerminatedInstances() {
+        long cutoff = System.currentTimeMillis() - 3_600_000L;
+        instances.entrySet().removeIf(e -> {
+            Instance inst = e.getValue();
+            return "terminated".equals(inst.getState().getName())
+                    && inst.getTerminatedAt() > 0
+                    && inst.getTerminatedAt() < cutoff;
+        });
     }
 
     public List<Instance> describeInstanceStatus(String region, List<String> instanceIds) {
@@ -435,7 +489,12 @@ public class Ec2Service {
         if (vpc == null) {
             throw new AwsException("InvalidVpcID.NotFound", "The vpc ID '" + vpcId + "' does not exist", 400);
         }
-        // no-op for mock
+        switch (attribute) {
+            case "enableDnsSupport"                    -> vpc.setEnableDnsSupport(Boolean.parseBoolean(value));
+            case "enableDnsHostnames"                  -> vpc.setEnableDnsHostnames(Boolean.parseBoolean(value));
+            case "enableNetworkAddressUsageMetrics"    -> vpc.setEnableNetworkAddressUsageMetrics(Boolean.parseBoolean(value));
+        }
+        vpcs.put(key(region, vpcId), vpc);
     }
 
     public Vpc describeVpcAttribute(String region, String vpcId, String attribute) {
@@ -496,7 +555,7 @@ public class Ec2Service {
         subnet.setAvailableIpAddressCount(251);
         subnet.setOwnerId(accountId);
         subnet.setRegion(region);
-        subnet.setSubnetArn("arn:aws:ec2:" + region + ":" + accountId + ":subnet/" + subnetId);
+        subnet.setSubnetArn(AwsArnUtils.Arn.of("ec2", region, accountId, "subnet/" + subnetId).toString());
         subnets.put(key(region, subnetId), subnet);
         return subnet;
     }
@@ -750,9 +809,27 @@ public class Ec2Service {
         kp.setKeyPairId(keyPairId);
         kp.setKeyName(keyName);
         kp.setKeyFingerprint("00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00");
+        kp.setPublicKey(publicKeyMaterial);
         kp.setRegion(region);
         keyPairs.put(key(region, keyPairId), kp);
         return kp;
+    }
+
+    public Instance findInstanceById(String instanceId) {
+        return instances.values().stream()
+                .filter(i -> instanceId.equals(i.getInstanceId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    public KeyPair findKeyPair(String region, String keyName) {
+        if (keyName == null) {
+            return null;
+        }
+        return keyPairs.values().stream()
+                .filter(k -> k.getRegion().equals(region) && keyName.equals(k.getKeyName()))
+                .findFirst()
+                .orElse(null);
     }
 
     // ─── AMIs ──────────────────────────────────────────────────────────────────
@@ -847,13 +924,32 @@ public class Ec2Service {
 
     public List<Map<String, String>> describeTags(String region, Map<String, List<String>> filters) {
         ensureDefaultResources(region);
+        List<String> filterResourceIds   = filters != null ? filters.get("resource-id")   : null;
+        List<String> filterResourceTypes = filters != null ? filters.get("resource-type") : null;
+        List<String> filterKeys          = filters != null ? filters.get("key")            : null;
+        List<String> filterValues        = filters != null ? filters.get("value")          : null;
+
         List<Map<String, String>> result = new ArrayList<>();
         for (Map.Entry<String, List<Tag>> entry : tags.entrySet()) {
-            String resourceId = entry.getKey();
+            String resourceId   = entry.getKey();
+            String resourceType = inferResourceType(resourceId);
+
+            if (filterResourceIds != null && !filterResourceIds.contains(resourceId)) {
+                continue;
+            }
+            if (filterResourceTypes != null && !filterResourceTypes.contains(resourceType)) {
+                continue;
+            }
             for (Tag tag : entry.getValue()) {
+                if (filterKeys != null && !filterKeys.contains(tag.getKey())) {
+                    continue;
+                }
+                if (filterValues != null && !filterValues.contains(tag.getValue())) {
+                    continue;
+                }
                 Map<String, String> item = new LinkedHashMap<>();
                 item.put("resourceId", resourceId);
-                item.put("resourceType", inferResourceType(resourceId));
+                item.put("resourceType", resourceType);
                 item.put("key", tag.getKey());
                 item.put("value", tag.getValue());
                 result.add(item);
@@ -1193,6 +1289,24 @@ public class Ec2Service {
             return switch (filterName) {
                 case "route-table-id" -> values.contains(rt.getRouteTableId());
                 case "vpc-id" -> values.contains(rt.getVpcId());
+                case "association.route-table-association-id" -> rt.getAssociations().stream()
+                        .anyMatch(a -> values.contains(a.getRouteTableAssociationId()));
+                case "association.subnet-id" -> rt.getAssociations().stream()
+                        .anyMatch(a -> a.getSubnetId() != null && values.contains(a.getSubnetId()));
+                case "association.gateway-id" -> rt.getAssociations().stream()
+                        .anyMatch(a -> a.getGatewayId() != null && values.contains(a.getGatewayId()));
+                case "association.main" -> rt.getAssociations().stream()
+                        .anyMatch(a -> values.contains(String.valueOf(a.isMain())));
+                default -> true;
+            };
+        }
+        if (resource instanceof Volume vol) {
+            return switch (filterName) {
+                case "volume-id" -> values.contains(vol.getVolumeId());
+                case "status" -> values.contains(vol.getState());
+                case "volume-type" -> values.contains(vol.getVolumeType());
+                case "availability-zone" -> values.contains(vol.getAvailabilityZone());
+                case "encrypted" -> values.contains(String.valueOf(vol.isEncrypted()));
                 default -> true;
             };
         }
@@ -1209,6 +1323,54 @@ public class Ec2Service {
         if (resource instanceof RouteTable rt) return rt.getTags();
         if (resource instanceof KeyPair kp) return kp.getTags();
         if (resource instanceof Address addr) return addr.getTags();
+        if (resource instanceof Volume vol) return vol.getTags();
         return Collections.emptyList();
+    }
+
+    // ─── Volumes ───────────────────────────────────────────────────────────────
+
+    public Volume createVolume(String region, String availabilityZone, String volumeType,
+                               int size, boolean encrypted, int iops, String snapshotId,
+                               List<Tag> volumeTags) {
+        ensureDefaultResources(region);
+        String volumeId = "vol-" + randomHex(17);
+        Volume vol = new Volume();
+        vol.setVolumeId(volumeId);
+        vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
+        vol.setVolumeType(volumeType != null ? volumeType : "gp2");
+        vol.setSize(size > 0 ? size : 8);
+        vol.setEncrypted(encrypted);
+        vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
+        vol.setSnapshotId(snapshotId);
+        vol.setCreateTime(Instant.now());
+        vol.setState("available");
+        vol.setRegion(region);
+        if (volumeTags != null) vol.setTags(new ArrayList<>(volumeTags));
+        volumes.put(key(region, volumeId), vol);
+        return vol;
+    }
+
+    public List<Volume> describeVolumes(String region, List<String> volumeIds,
+                                        Map<String, List<String>> filters) {
+        if (volumeIds != null && !volumeIds.isEmpty()) {
+            for (String id : volumeIds) {
+                if (volumes.get(key(region, id)) == null) {
+                    throw new AwsException("InvalidVolume.NotFound",
+                            "The volume '" + id + "' does not exist.", 400);
+                }
+            }
+        }
+        return volumes.values().stream()
+                .filter(v -> v.getRegion().equals(region))
+                .filter(v -> volumeIds == null || volumeIds.isEmpty() || volumeIds.contains(v.getVolumeId()))
+                .filter(v -> matchesFilters(v, filters, region))
+                .collect(Collectors.toList());
+    }
+
+    public void deleteVolume(String region, String volumeId) {
+        if (volumes.remove(key(region, volumeId)) == null) {
+            throw new AwsException("InvalidVolume.NotFound",
+                    "The volume '" + volumeId + "' does not exist.", 400);
+        }
     }
 }

@@ -18,6 +18,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -37,6 +38,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @ApplicationScoped
 public class S3Service {
+    private static final String DEFAULT_OWNER_ID = "000000000000";
+    private static final String DEFAULT_OWNER_DISPLAY_NAME = "floci";
+    private static final String ALL_USERS_GROUP_URI = "http://acs.amazonaws.com/groups/global/AllUsers";
+    private static final String AUTHENTICATED_USERS_GROUP_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+    private static final Set<String> SUPPORTED_SERVER_SIDE_ENCRYPTION_VALUES = Set.of("AES256", "aws:kms", "aws:kms:dsse", "aws:fsx");
 
     @FunctionalInterface
     interface LambdaInvoker {
@@ -59,6 +65,7 @@ public class S3Service {
     private final Instance<LambdaService> lambdaServiceProvider;
     private final LambdaInvoker lambdaInvoker;
     private final EventBridgeService eventBridgeService;
+    private final Event<S3ObjectUpdatedEvent> s3UpdatedEvent;
     private final RegionResolver regionResolver;
     private final String baseUrl;
     private final ObjectMapper objectMapper;
@@ -68,6 +75,7 @@ public class S3Service {
                      SqsService sqsService, SnsService snsService,
                      Instance<LambdaService> lambdaServiceProvider,
                      EventBridgeService eventBridgeService,
+                     Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                      RegionResolver regionResolver,
                      ObjectMapper objectMapper) {
         this(
@@ -80,7 +88,7 @@ public class S3Service {
                 Path.of(config.storage().persistentPath()).resolve("s3"),
                 "memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode())),
                 sqsService, snsService, null, lambdaServiceProvider, null,
-                eventBridgeService,
+                eventBridgeService, s3UpdatedEvent,
                 regionResolver,
                 config.effectiveBaseUrl(), objectMapper
         );
@@ -93,7 +101,7 @@ public class S3Service {
               StorageBackend<String, S3Object> objectStore,
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, dataRoot, inMemory, null, null, null, null, null, null, null,
-                "http://localhost:4566", new ObjectMapper());
+                null, "http://localhost:4566", new ObjectMapper());
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -101,8 +109,8 @@ public class S3Service {
               Path dataRoot, boolean inMemory,
               LambdaService lambdaService,
               RegionResolver regionResolver) {
-        this(bucketStore, objectStore, dataRoot, inMemory, null, null, lambdaService, null, null, null, regionResolver,
-                "http://localhost:4566", new ObjectMapper());
+        this(bucketStore, objectStore, dataRoot, inMemory, null, null, lambdaService, null, null, null, null,
+                regionResolver, "http://localhost:4566", new ObjectMapper());
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -110,8 +118,8 @@ public class S3Service {
               Path dataRoot, boolean inMemory,
               LambdaInvoker lambdaInvoker,
               RegionResolver regionResolver) {
-        this(bucketStore, objectStore, dataRoot, inMemory, null, null, null, null, lambdaInvoker, null, regionResolver,
-                "http://localhost:4566", new ObjectMapper());
+        this(bucketStore, objectStore, dataRoot, inMemory, null, null, null, null, lambdaInvoker, null, null,
+                regionResolver, "http://localhost:4566", new ObjectMapper());
     }
 
     private S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -121,6 +129,7 @@ public class S3Service {
                       Instance<LambdaService> lambdaServiceProvider,
                       LambdaInvoker lambdaInvoker,
                       EventBridgeService eventBridgeService,
+                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                       RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper) {
         this.bucketStore = bucketStore;
         this.objectStore = objectStore;
@@ -132,6 +141,7 @@ public class S3Service {
         this.lambdaServiceProvider = lambdaServiceProvider;
         this.lambdaInvoker = lambdaInvoker;
         this.eventBridgeService = eventBridgeService;
+        this.s3UpdatedEvent = s3UpdatedEvent;
         this.regionResolver = regionResolver;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
@@ -184,30 +194,51 @@ public class S3Service {
 
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata) {
-        return putObject(bucketName, key, data, contentType, metadata, null, null, null, null, null, null);
+        return putObject(bucketName, key, data, contentType, metadata, new PutObjectOptions());
     }
 
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata,
                               String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
-        return putObject(bucketName, key, data, contentType, metadata, null, null,
-                objectLockMode, retainUntilDate, legalHoldStatus, null);
+        return putObject(bucketName, key, data, contentType, metadata,
+                new PutObjectOptions()
+                        .withObjectLockMode(objectLockMode)
+                        .withRetainUntilDate(retainUntilDate)
+                        .withLegalHoldStatus(legalHoldStatus));
     }
 
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata, String storageClass,
                               String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
-        return putObject(bucketName, key, data, contentType, metadata, storageClass, null,
-                objectLockMode, retainUntilDate, legalHoldStatus, null);
+        return putObject(bucketName, key, data, contentType, metadata,
+                new PutObjectOptions()
+                        .withStorageClass(storageClass)
+                        .withObjectLockMode(objectLockMode)
+                        .withRetainUntilDate(retainUntilDate)
+                        .withLegalHoldStatus(legalHoldStatus));
     }
 
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata, String storageClass,
                               String contentEncoding,
                               String objectLockMode, Instant retainUntilDate, String legalHoldStatus,
-                              String cacheControl) {
-        S3Object object = storeObject(bucketName, key, data, contentType, metadata, storageClass, null, null,
-                objectLockMode, retainUntilDate, legalHoldStatus, contentEncoding, cacheControl);
+                              String contentDisposition, String cacheControl, String serverSideEncryption, String acl) {
+        return putObject(bucketName, key, data, contentType, metadata,
+                new PutObjectOptions()
+                        .withStorageClass(storageClass)
+                        .withContentEncoding(contentEncoding)
+                        .withObjectLockMode(objectLockMode)
+                        .withRetainUntilDate(retainUntilDate)
+                        .withLegalHoldStatus(legalHoldStatus)
+                        .withContentDisposition(contentDisposition)
+                        .withCacheControl(cacheControl)
+                        .withServerSideEncryption(serverSideEncryption)
+                        .withAcl(acl));
+    }
+
+    public S3Object putObject(String bucketName, String key, byte[] data,
+                              String contentType, Map<String, String> metadata, PutObjectOptions options) {
+        S3Object object = storeObject(bucketName, key, data, contentType, metadata, null, null, options);
         fireNotifications(bucketName, key, "ObjectCreated:Put", object);
         return object;
     }
@@ -217,36 +248,42 @@ public class S3Service {
      */
     private S3Object storeObject(String bucketName, String key, byte[] data,
                                  String contentType, Map<String, String> metadata) {
-        return storeObject(bucketName, key, data, contentType, metadata, null, null, null,
-                null, null, null, null, null);
+        return storeObject(bucketName, key, data, contentType, metadata, null, null, new PutObjectOptions());
     }
 
     private S3Object storeObject(String bucketName, String key, byte[] data,
                                  String contentType, Map<String, String> metadata, String storageClass,
                                  S3Checksum checksum, List<Part> parts,
                                  String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
-        return storeObject(bucketName, key, data, contentType, metadata, storageClass, checksum, parts,
-                objectLockMode, retainUntilDate, legalHoldStatus, null, null);
+        return storeObject(bucketName, key, data, contentType, metadata, checksum, parts,
+                new PutObjectOptions()
+                        .withStorageClass(storageClass)
+                        .withObjectLockMode(objectLockMode)
+                        .withRetainUntilDate(retainUntilDate)
+                        .withLegalHoldStatus(legalHoldStatus));
     }
 
     private S3Object storeObject(String bucketName, String key, byte[] data,
-                                 String contentType, Map<String, String> metadata, String storageClass,
-                                 S3Checksum checksum, List<Part> parts,
-                                 String objectLockMode, Instant retainUntilDate, String legalHoldStatus,
-                                 String contentEncoding, String cacheControl) {
+                                 String contentType, Map<String, String> metadata,
+                                 S3Checksum checksum, List<Part> parts, PutObjectOptions options) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
+        PutObjectOptions effectiveOptions = options != null ? options : new PutObjectOptions();
+        String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
 
         S3Object object = new S3Object(bucketName, key, data, contentType);
         if (metadata != null) {
             object.getMetadata().putAll(metadata);
         }
-        object.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
+        object.setStorageClass(ObjectAttributeName.normalizeStorageClass(effectiveOptions.getStorageClass()));
         object.setChecksum(checksum != null ? copyChecksum(checksum) : buildChecksum(data, parts, false));
         object.setParts(copyParts(parts));
-        object.setContentEncoding(contentEncoding);
-        object.setCacheControl(cacheControl);
+        object.setContentEncoding(effectiveOptions.getContentEncoding());
+        object.setContentDisposition(effectiveOptions.getContentDisposition());
+        object.setCacheControl(effectiveOptions.getCacheControl());
+        object.setServerSideEncryption(normalizedServerSideEncryption);
+        object.setAcl(cannedObjectAclXml(effectiveOptions.getAcl()));
 
         if (bucket.isVersioningEnabled()) {
             String versionId = UUID.randomUUID().toString();
@@ -266,7 +303,10 @@ public class S3Service {
             });
 
             // Apply lock fields from request or bucket default
-            applyObjectLock(object, bucket, objectLockMode, retainUntilDate, legalHoldStatus);
+            applyObjectLock(object, bucket,
+                    effectiveOptions.getObjectLockMode(),
+                    effectiveOptions.getRetainUntilDate(),
+                    effectiveOptions.getLegalHoldStatus());
 
             // Store versioned copy and update latest pointer
             objectStore.put(versionedKey(bucketName, key, versionId), object);
@@ -285,12 +325,17 @@ public class S3Service {
             }
 
             // Apply lock fields from request or bucket default
-            applyObjectLock(object, bucket, objectLockMode, retainUntilDate, legalHoldStatus);
+            applyObjectLock(object, bucket,
+                    effectiveOptions.getObjectLockMode(),
+                    effectiveOptions.getRetainUntilDate(),
+                    effectiveOptions.getLegalHoldStatus());
 
             objectStore.put(objectKey(bucketName, key), object);
             writeFile(bucketName, key, data);
             LOG.debugv("Put object: {0}/{1} ({2} bytes)", bucketName, key, data.length);
         }
+        // Release cached payload reference - data is now persisted to disk (or to memoryDataStore in inMemory mode)
+        object.setData(null);
         return object;
     }
 
@@ -349,9 +394,7 @@ public class S3Service {
     }
 
     public S3Object getObjectMetadata(String bucketName, String key, String versionId) {
-        S3Object copy = copyObject(getStoredObject(bucketName, key, versionId));
-        copy.setData(null);
-        return copy;
+        return copyObject(getStoredObject(bucketName, key, versionId));
     }
 
     public GetObjectAttributesResult getObjectAttributes(String bucketName, String key, String versionId,
@@ -590,39 +633,79 @@ public class S3Service {
 
     public S3Object copyObject(String sourceBucket, String sourceKey,
                                String destBucket, String destKey) {
-        return copyObject(sourceBucket, sourceKey, destBucket, destKey,
-                null, null, null, null);
+        return copyObject(sourceBucket, sourceKey, destBucket, destKey, new CopyObjectOptions());
     }
 
     public S3Object copyObject(String sourceBucket, String sourceKey,
                                String destBucket, String destKey,
                                String metadataDirective, Map<String, String> replacementMetadata,
                                String storageClass, String contentType) {
-        return copyObject(sourceBucket, sourceKey, destBucket, destKey, metadataDirective,
-                replacementMetadata, storageClass, contentType, null, null);
+        return copyObject(sourceBucket, sourceKey, destBucket, destKey,
+                new CopyObjectOptions()
+                        .withMetadataDirective(metadataDirective)
+                        .withReplacementMetadata(replacementMetadata)
+                        .withStorageClass(storageClass)
+                        .withContentType(contentType));
     }
 
     public S3Object copyObject(String sourceBucket, String sourceKey,
                                String destBucket, String destKey,
                                String metadataDirective, Map<String, String> replacementMetadata,
                                String storageClass, String contentType, String contentEncoding,
-                               String cacheControl) {
+                               String contentDisposition, String cacheControl, String serverSideEncryption, String acl) {
+        return copyObject(sourceBucket, sourceKey, destBucket, destKey,
+                new CopyObjectOptions()
+                        .withMetadataDirective(metadataDirective)
+                        .withReplacementMetadata(replacementMetadata)
+                        .withStorageClass(storageClass)
+                        .withContentType(contentType)
+                        .withContentEncoding(contentEncoding)
+                        .withContentDisposition(contentDisposition)
+                        .withCacheControl(cacheControl)
+                        .withServerSideEncryption(serverSideEncryption)
+                        .withAcl(acl));
+    }
+
+    public S3Object copyObject(String sourceBucket, String sourceKey,
+                               String destBucket, String destKey, CopyObjectOptions options) {
         S3Object source = getObject(sourceBucket, sourceKey);
         ensureBucketExists(destBucket);
+        CopyObjectOptions effectiveOptions = options != null ? options : new CopyObjectOptions();
+        String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
 
-        boolean replaceMetadata = "REPLACE".equalsIgnoreCase(metadataDirective);
+        boolean replaceMetadata = "REPLACE".equalsIgnoreCase(effectiveOptions.getMetadataDirective());
         Map<String, String> metadata = replaceMetadata ? new LinkedHashMap<>() : new LinkedHashMap<>(source.getMetadata());
-        if (replaceMetadata && replacementMetadata != null) {
-            metadata.putAll(replacementMetadata);
+        if (replaceMetadata && effectiveOptions.getReplacementMetadata() != null) {
+            metadata.putAll(effectiveOptions.getReplacementMetadata());
         }
 
-        String effectiveContentType = replaceMetadata && contentType != null ? contentType : source.getContentType();
-        String effectiveStorageClass = storageClass != null ? storageClass : source.getStorageClass();
-        String effectiveContentEncoding = replaceMetadata && contentEncoding != null ? contentEncoding : source.getContentEncoding();
-        String effectiveCacheControl = replaceMetadata && cacheControl != null ? cacheControl : source.getCacheControl();
+        String effectiveContentType = replaceMetadata && effectiveOptions.getContentType() != null
+                ? effectiveOptions.getContentType()
+                : source.getContentType();
+        String effectiveStorageClass = effectiveOptions.getStorageClass() != null
+                ? effectiveOptions.getStorageClass()
+                : source.getStorageClass();
+        String effectiveContentEncoding = replaceMetadata && effectiveOptions.getContentEncoding() != null
+                ? effectiveOptions.getContentEncoding()
+                : source.getContentEncoding();
+        String effectiveContentDisposition = replaceMetadata && effectiveOptions.getContentDisposition() != null
+                ? effectiveOptions.getContentDisposition()
+                : source.getContentDisposition();
+        String effectiveCacheControl = replaceMetadata && effectiveOptions.getCacheControl() != null
+                ? effectiveOptions.getCacheControl()
+                : source.getCacheControl();
+        String effectiveServerSideEncryption = normalizedServerSideEncryption != null
+                ? normalizedServerSideEncryption
+                : source.getServerSideEncryption();
         S3Object copy = storeObject(destBucket, destKey, source.getData(), effectiveContentType, metadata,
-                effectiveStorageClass, source.getChecksum(), source.getParts(), null, null, null,
-                effectiveContentEncoding, effectiveCacheControl);
+                source.getChecksum(), source.getParts(),
+                new PutObjectOptions()
+                        .withStorageClass(effectiveStorageClass)
+                        .withContentEncoding(effectiveContentEncoding)
+                        .withContentDisposition(effectiveContentDisposition)
+                        .withCacheControl(effectiveCacheControl)
+                        .withServerSideEncryption(effectiveServerSideEncryption)
+                        .withAcl(effectiveOptions.getAcl()));
         copy.setETag(source.getETag());
         LOG.debugv("Copied object: {0}/{1} -> {2}/{3}", sourceBucket, sourceKey, destBucket, destKey);
         fireNotifications(destBucket, destKey, "ObjectCreated:Copy", copy);
@@ -662,6 +745,15 @@ public class S3Service {
         // Scan for versioned entries (contain #v#)
         List<S3Object> versions = new ArrayList<>(objectStore.scan(key ->
                 key.startsWith(fullPrefix) && key.contains("#v#")));
+
+        // Also include non-versioned objects (no #v# in storage key, versionId == null).
+        // These are objects uploaded when versioning was disabled or before versioning was enabled.
+        // Versioned latest-pointer entries (also stored at the plain key) are excluded because
+        // they have a non-null versionId; their #v# entry is already captured above.
+        objectStore.scan(key -> key.startsWith(fullPrefix) && !key.contains("#v#"))
+                .stream()
+                .filter(obj -> obj.getVersionId() == null)
+                .forEach(versions::add);
 
         // Sort by key, then by lastModified descending
         versions.sort((a, b) -> {
@@ -788,6 +880,34 @@ public class S3Service {
         return bucket.getTags() != null ? bucket.getTags() : Map.of();
     }
 
+    public void putBucketWebsite(String bucketName, WebsiteConfiguration config) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        bucket.setWebsiteConfiguration(config);
+        bucketStore.put(bucketName, bucket);
+        LOG.infov("Set website configuration for bucket: {0}", bucketName);
+    }
+
+    public WebsiteConfiguration getBucketWebsite(String bucketName) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        if (bucket.getWebsiteConfiguration() == null) {
+            throw new AwsException("NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration.", 404);
+        }
+        return bucket.getWebsiteConfiguration();
+    }
+
+    public void deleteBucketWebsite(String bucketName) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        bucket.setWebsiteConfiguration(null);
+        bucketStore.put(bucketName, bucket);
+        LOG.infov("Deleted website configuration for bucket: {0}", bucketName);
+    }
+
     public void deleteBucketTagging(String bucketName) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
@@ -902,17 +1022,30 @@ public class S3Service {
     // --- Multipart Upload Operations ---
 
     public MultipartUpload initiateMultipartUpload(String bucket, String key, String contentType) {
-        return initiateMultipartUpload(bucket, key, contentType, null, null);
+        return initiateMultipartUpload(bucket, key, contentType, null, null, null, null, null);
     }
 
     public MultipartUpload initiateMultipartUpload(String bucket, String key, String contentType,
                                                    Map<String, String> metadata, String storageClass) {
+        return initiateMultipartUpload(bucket, key, contentType, metadata, storageClass, null, null, null);
+    }
+
+    public MultipartUpload initiateMultipartUpload(String bucket, String key, String contentType,
+                                                   Map<String, String> metadata, String storageClass,
+                                                   String contentDisposition, String serverSideEncryption, String acl) {
         ensureBucketExists(bucket);
+        if (acl != null && !acl.isBlank()) {
+            cannedObjectAclXml(acl);
+        }
+        String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
         MultipartUpload upload = new MultipartUpload(bucket, key, contentType);
         if (metadata != null) {
             upload.getMetadata().putAll(metadata);
         }
         upload.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
+        upload.setContentDisposition(contentDisposition);
+        upload.setServerSideEncryption(normalizedServerSideEncryption);
+        upload.setAcl(acl);
 
         if (inMemory) {
             memoryMultipartStore.put(upload.getUploadId(), new ConcurrentHashMap<>());
@@ -1018,7 +1151,12 @@ public class S3Service {
                     .toList();
             S3Checksum checksum = buildChecksum(allData, completedParts, true);
             S3Object object = storeObject(bucket, key, allData, upload.getContentType(), upload.getMetadata(),
-                    upload.getStorageClass(), checksum, completedParts, null, null, null);
+                    checksum, completedParts,
+                    new PutObjectOptions()
+                            .withStorageClass(upload.getStorageClass())
+                            .withContentDisposition(upload.getContentDisposition())
+                            .withServerSideEncryption(upload.getServerSideEncryption())
+                            .withAcl(upload.getAcl()));
             // Override the ETag with the composite multipart ETag
             object.setETag(compositeETag);
             objectStore.put(objectKey(bucket, key), object);
@@ -1219,33 +1357,47 @@ public class S3Service {
         bucketStore.put(bucketName, bucket);
     }
 
-    public String getBucketLifecycle(String bucketName) {
+    public static final String DEFAULT_TRANSITION_DEFAULT_MIN_OBJECT_SIZE = "all_storage_classes_128K";
+
+    public record LifecycleConfigurationResult(String xml, String transitionDefaultMinimumObjectSize) {}
+
+    public LifecycleConfigurationResult getBucketLifecycle(String bucketName) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
         if (bucket.getLifecycleConfiguration() == null) {
             throw new AwsException("NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", 404);
         }
-        return bucket.getLifecycleConfiguration();
+        String size = bucket.getTransitionDefaultMinimumObjectSize();
+        if (size == null) {
+            size = DEFAULT_TRANSITION_DEFAULT_MIN_OBJECT_SIZE;
+        }
+        return new LifecycleConfigurationResult(bucket.getLifecycleConfiguration(), size);
     }
 
-    public void putBucketLifecycle(String bucketName, String lifecycle) {
+    public String putBucketLifecycle(String bucketName, String lifecycle, String transitionDefaultMinimumObjectSize) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
         bucket.setLifecycleConfiguration(lifecycle);
+        String size = (transitionDefaultMinimumObjectSize == null || transitionDefaultMinimumObjectSize.isBlank())
+                ? DEFAULT_TRANSITION_DEFAULT_MIN_OBJECT_SIZE
+                : transitionDefaultMinimumObjectSize;
+        bucket.setTransitionDefaultMinimumObjectSize(size);
         bucketStore.put(bucketName, bucket);
+        return size;
     }
 
     public void deleteBucketLifecycle(String bucketName) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
         bucket.setLifecycleConfiguration(null);
+        bucket.setTransitionDefaultMinimumObjectSize(null);
         bucketStore.put(bucketName, bucket);
     }
 
     public String getBucketAcl(String bucketName) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        return bucket.getAcl() != null ? bucket.getAcl() : defaultAclXml("000000000000", "floci");
+        return bucket.getAcl() != null ? bucket.getAcl() : defaultAclXml(DEFAULT_OWNER_ID, DEFAULT_OWNER_DISPLAY_NAME);
     }
 
     public void putBucketAcl(String bucketName, String acl) {
@@ -1257,7 +1409,7 @@ public class S3Service {
 
     public String getObjectAcl(String bucketName, String key, String versionId) {
         S3Object obj = getObject(bucketName, key, versionId);
-        return obj.getAcl() != null ? obj.getAcl() : defaultAclXml("000000000000", "floci");
+        return obj.getAcl() != null ? obj.getAcl() : defaultAclXml(DEFAULT_OWNER_ID, DEFAULT_OWNER_DISPLAY_NAME);
     }
 
     public void putObjectAcl(String bucketName, String key, String versionId, String acl) {
@@ -1315,13 +1467,37 @@ public class S3Service {
         bucketStore.put(bucketName, bucket);
     }
 
+    public String getBucketOwnershipControls(String bucketName) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        if (bucket.getOwnershipControlsConfiguration() == null) {
+            throw new AwsException("OwnershipControlsNotFoundError",
+                    "The bucket ownership controls were not found.", 404);
+        }
+        return bucket.getOwnershipControlsConfiguration();
+    }
+
+    public void putBucketOwnershipControls(String bucketName, String ownershipControlsXml) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        bucket.setOwnershipControlsConfiguration(ownershipControlsXml);
+        bucketStore.put(bucketName, bucket);
+    }
+
+    public void deleteBucketOwnershipControls(String bucketName) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        bucket.setOwnershipControlsConfiguration(null);
+        bucketStore.put(bucketName, bucket);
+    }
+
     public void restoreObject(String bucketName, String key, String versionId, String restoreXml) {
         // Validation only - stub implementation
         getObject(bucketName, key, versionId);
         LOG.infov("Restored object: {0}/{1} (stub)", bucketName, key);
     }
 
-    private String defaultAclXml(String id, String displayName) {
+    private static String defaultAclXml(String id, String displayName) {
         return new XmlBuilder()
                 .start("AccessControlPolicy")
                   .start("Owner")
@@ -1341,7 +1517,96 @@ public class S3Service {
                 .build();
     }
 
+    static String cannedObjectAclXml(String cannedAcl) {
+        if (cannedAcl == null || cannedAcl.isBlank()) {
+            return null;
+        }
+        return switch (cannedAcl) {
+            case "private", "bucket-owner-read", "bucket-owner-full-control" ->
+                    defaultAclXml(DEFAULT_OWNER_ID, DEFAULT_OWNER_DISPLAY_NAME);
+            // Floci currently runs as a single synthetic account, so there is no distinct EC2 bundle-reader
+            // principal to represent in GetObjectAcl responses yet.
+            case "aws-exec-read" -> defaultAclXml(DEFAULT_OWNER_ID, DEFAULT_OWNER_DISPLAY_NAME);
+            case "public-read" -> objectAclXml(
+                    ownerFullControlGrant(),
+                    groupGrant(ALL_USERS_GROUP_URI, "READ"));
+            case "public-read-write" -> objectAclXml(
+                    ownerFullControlGrant(),
+                    groupGrant(ALL_USERS_GROUP_URI, "READ"),
+                    groupGrant(ALL_USERS_GROUP_URI, "WRITE"));
+            case "authenticated-read" -> objectAclXml(
+                    ownerFullControlGrant(),
+                    groupGrant(AUTHENTICATED_USERS_GROUP_URI, "READ"));
+            default -> throw new AwsException("InvalidArgument",
+                    "Unsupported x-amz-acl value: " + cannedAcl, 400);
+        };
+    }
+
+    static String normalizeServerSideEncryption(String serverSideEncryption) {
+        if (serverSideEncryption == null) {
+            return null;
+        }
+
+        String normalized = serverSideEncryption.trim();
+        if (normalized.isEmpty()) {
+            return null;
+        }
+
+        if (!SUPPORTED_SERVER_SIDE_ENCRYPTION_VALUES.contains(normalized)) {
+            throw new AwsException("InvalidArgument",
+                    "Unsupported x-amz-server-side-encryption value: " + normalized, 400);
+        }
+
+        return normalized;
+    }
+
+    private static String ownerFullControlGrant() {
+        return canonicalUserGrant(DEFAULT_OWNER_ID, DEFAULT_OWNER_DISPLAY_NAME, "FULL_CONTROL");
+    }
+
+    private static String canonicalUserGrant(String id, String displayName, String permission) {
+        return new XmlBuilder()
+                .start("Grant")
+                .raw("<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">")
+                .elem("ID", id)
+                .elem("DisplayName", displayName)
+                .raw("</Grantee>")
+                .elem("Permission", permission)
+                .end("Grant")
+                .build();
+    }
+
+    private static String groupGrant(String uri, String permission) {
+        return new XmlBuilder()
+                .start("Grant")
+                .raw("<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">")
+                .elem("URI", uri)
+                .raw("</Grantee>")
+                .elem("Permission", permission)
+                .end("Grant")
+                .build();
+    }
+
+    private static String objectAclXml(String... grants) {
+        XmlBuilder xml = new XmlBuilder()
+                .start("AccessControlPolicy")
+                .start("Owner")
+                .elem("ID", DEFAULT_OWNER_ID)
+                .elem("DisplayName", DEFAULT_OWNER_DISPLAY_NAME)
+                .end("Owner")
+                .start("AccessControlList");
+        for (String grant : grants) {
+            xml.raw(grant);
+        }
+        return xml.end("AccessControlList")
+                .end("AccessControlPolicy")
+                .build();
+    }
+
     private void fireNotifications(String bucketName, String key, String eventName, S3Object obj) {
+        if (s3UpdatedEvent != null && eventName.startsWith("ObjectCreated")) {
+            s3UpdatedEvent.fire(new S3ObjectUpdatedEvent(bucketName, key));
+        }
         if (sqsService == null && snsService == null && lambdaService == null
                 && lambdaServiceProvider == null && lambdaInvoker == null && eventBridgeService == null) {
             return;
@@ -1361,7 +1626,7 @@ public class S3Service {
         for (QueueNotification qn : config.getQueueConfigurations()) {
             if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && qn.matchesKey(key)) {
                 try {
-                    sqsService.sendMessage(sqsUrlFromArn(qn.queueArn()), eventJson, 0);
+                    sqsService.sendMessage(sqsUrlFromArn(qn.queueArn()), eventJson, 0, extractRegionFromArn(qn.queueArn()));
                     LOG.debugv("Fired S3 event {0} to SQS {1}", eventName, qn.queueArn());
                 } catch (Exception e) {
                     LOG.warnv("Failed to deliver S3 event to SQS {0}: {1}", qn.queueArn(), e.getMessage());
@@ -1502,7 +1767,7 @@ public class S3Service {
 
             ObjectNode bucketNode = objectMapper.createObjectNode();
             bucketNode.put("name", bucketName);
-            bucketNode.put("arn", "arn:aws:s3:::" + bucketName);
+            bucketNode.put("arn", AwsArnUtils.Arn.of("s3", "", "", bucketName).toString());
 
             ObjectNode objectNode = objectMapper.createObjectNode();
             objectNode.put("key", key);
@@ -1564,7 +1829,9 @@ public class S3Service {
         copy.setMetadata(new HashMap<>(source.getMetadata()));
         copy.setContentType(source.getContentType());
         copy.setContentEncoding(source.getContentEncoding());
+        copy.setContentDisposition(source.getContentDisposition());
         copy.setCacheControl(source.getCacheControl());
+        copy.setServerSideEncryption(source.getServerSideEncryption());
         copy.setSize(source.getSize());
         copy.setLastModified(source.getLastModified());
         copy.setETag(source.getETag());
@@ -1654,11 +1921,33 @@ public class S3Service {
     private static final String DATA_SUFFIX = ".s3data";
 
     private Path resolveObjectPath(String bucketName, String key) {
-        return dataRoot.resolve(bucketName).resolve(key + DATA_SUFFIX);
+        Path bucketDir = dataRoot.resolve(bucketName).normalize();
+        
+        String safeKey = key;
+        while (safeKey.startsWith("/")) {
+            safeKey = safeKey.substring(1);
+        }
+        
+        Path resolved = bucketDir.resolve(safeKey + DATA_SUFFIX).normalize();
+        if (!resolved.startsWith(bucketDir)) {
+            throw new AwsException("InvalidKey", "The specified key is invalid.", 400);
+        }
+        return resolved;
     }
 
     private Path resolveVersionedPath(String bucketName, String key, String versionId) {
-        return dataRoot.resolve(".versions").resolve(bucketName).resolve(key).resolve(versionId + DATA_SUFFIX);
+        Path baseDir = dataRoot.resolve(".versions").resolve(bucketName).normalize();
+        
+        String safeKey = key;
+        while (safeKey.startsWith("/")) {
+            safeKey = safeKey.substring(1);
+        }
+        
+        Path resolved = baseDir.resolve(safeKey).resolve(versionId + DATA_SUFFIX).normalize();
+        if (!resolved.startsWith(baseDir)) {
+            throw new AwsException("InvalidKey", "The specified key is invalid.", 400);
+        }
+        return resolved;
     }
 
     private void writeVersionedFile(String bucketName, String key, String versionId, byte[] data) {

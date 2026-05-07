@@ -11,11 +11,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 @ApplicationScoped
 public class SecretsManagerJsonHandler {
@@ -47,6 +47,7 @@ public class SecretsManagerJsonHandler {
             case "BatchGetSecretValue" -> handleBatchGetSecretValue(request, region);
             case "DeleteResourcePolicy" -> Response.ok(objectMapper.createObjectNode()).build();
             case "PutResourcePolicy" -> Response.ok(objectMapper.createObjectNode()).build();
+            case "UpdateSecretVersionStage" -> handleUpdateSecretVersionStage(request, region);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -146,8 +147,12 @@ public class SecretsManagerJsonHandler {
         String secretString = request.has("SecretString") ? request.path("SecretString").asText() : null;
         String secretBinary = request.has("SecretBinary") ? request.path("SecretBinary").asText() : null;
 
+        List<String> versionStages = request.has("VersionStages") && request.path("VersionStages").isArray()
+                ? StreamSupport.stream(request.path("VersionStages").spliterator(), false).map(JsonNode::asText).toList()
+                : null;
+
         Secret secret = service.describeSecret(secretId, region);
-        SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, region);
+        SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, region, versionStages);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
@@ -172,7 +177,7 @@ public class SecretsManagerJsonHandler {
 
         String versionId = null;
         if (secretString != null || secretBinary != null) {
-            SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, region);
+            SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, region, null);
             versionId = version.getVersionId();
         }
 
@@ -396,6 +401,21 @@ public class SecretsManagerJsonHandler {
                     .entity(new AwsErrorResponse("InvalidParameterException", e.getMessage()))
                     .build();
         }
+    }
+
+    private Response handleUpdateSecretVersionStage(JsonNode request, String region) {
+        String secretId = request.path("SecretId").asText();
+        String moveToVersionId = request.path("MoveToVersionId").asText(null);
+        String removeFromVersionId = request.path("RemoveFromVersionId").asText(null);
+        String versionStage = request.path("VersionStage").asText();
+
+        Secret secret = service.updateSecretVersionStage(secretId,
+                moveToVersionId, removeFromVersionId, versionStage, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("ARN", secret.getArn());
+        response.put("Name", secret.getName());
+        return Response.ok(response).build();
     }
 
     private List<Secret.Tag> parseTags(JsonNode request) {

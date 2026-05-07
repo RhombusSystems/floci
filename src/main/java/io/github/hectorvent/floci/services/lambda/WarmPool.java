@@ -103,8 +103,23 @@ public class WarmPool {
 
         if (!ephemeral) {
             ArrayDeque<ContainerHandle> queue = pool.computeIfAbsent(fn.getFunctionName(), k -> new ArrayDeque<>());
-            synchronized (queue) {
-                handle = queue.pollFirst();
+            // Skip pooled handles whose container died out-of-band — otherwise the
+            // caller would wait the full Lambda function timeout.
+            while (true) {
+                ContainerHandle candidate;
+                synchronized (queue) {
+                    candidate = queue.pollFirst();
+                }
+                if (candidate == null) {
+                    break;
+                }
+                if (containerLauncher.isAlive(candidate)) {
+                    handle = candidate;
+                    break;
+                }
+                LOG.infov("Discarding dead pooled container {0} for function {1}",
+                        candidate.getContainerId(), fn.getFunctionName());
+                stopQuietly(candidate);
             }
         }
 
@@ -126,8 +141,9 @@ public class WarmPool {
      */
     public void release(ContainerHandle handle) {
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
-        if (ephemeral) {
-            LOG.debugv("Ephemeral: stopping container {0} after invocation", handle.getContainerId());
+        if (ephemeral || handle.isHotReload()) {
+            LOG.debugv("{0}: stopping container {1} after invocation",
+                    handle.isHotReload() ? "Hot-reload" : "Ephemeral", handle.getContainerId());
             stopQuietly(handle);
             return;
         }
@@ -148,6 +164,27 @@ public class WarmPool {
             LOG.debugv("Pool full for function {0}, stopping excess container", handle.getFunctionName());
             stopQuietly(handle);
         }
+    }
+
+    /**
+     * Pushes a code update to all warm containers in the pool for the given function.
+     * In this implementation, we drain the containers to force a fresh start with new code.
+     */
+    public void pushCodeUpdate(LambdaFunction fn) {
+        LOG.infov("Reactive S3 Sync: invalidating warm pool for function {0} to pick up new code",
+                fn.getFunctionName());
+        drainFunction(fn.getFunctionName());
+    }
+
+    /**
+     * Stops and removes a single container that is no longer usable (e.g. after a timeout).
+     * The container must have already been acquired (removed from the pool) so only a
+     * stop is needed — no pool bookkeeping required.
+     */
+    public void destroyHandle(ContainerHandle handle) {
+        LOG.debugv("Destroying timed-out container {0} for function {1}",
+                handle.getContainerId(), handle.getFunctionName());
+        stopQuietly(handle);
     }
 
     /**

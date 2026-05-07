@@ -26,6 +26,9 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 
@@ -83,9 +86,15 @@ public class LambdaController {
         ObjectNode root = objectMapper.createObjectNode();
         root.set("Configuration", objectMapper.valueToTree(buildFunctionConfiguration(fn)));
         ObjectNode code = root.putObject("Code");
-        code.put("Location", "https://awslambda-" + region + "-tasks.s3." + region
-                + ".amazonaws.com/" + fn.getFunctionName());
-        code.put("RepositoryType", "S3");
+        if ("Image".equals(fn.getPackageType()) && fn.getImageUri() != null) {
+            code.put("RepositoryType", "ECR");
+            code.put("ImageUri", fn.getImageUri());
+            code.put("ResolvedImageUri", fn.getImageUri());
+        } else {
+            code.put("Location", "https://awslambda-" + region + "-tasks.s3." + region
+                    + ".amazonaws.com/" + fn.getFunctionName());
+            code.put("RepositoryType", "S3");
+        }
 
         return Response.ok(root).build();
     }
@@ -115,6 +124,26 @@ public class LambdaController {
         String region = regionResolver.resolveRegion(headers);
         LambdaFunction fn = lambdaService.getFunction(region, functionName);
         return Response.ok(buildFunctionConfiguration(fn)).build();
+    }
+
+    // ──────────────────────────── UpdateFunctionConfiguration ────────────────────────────
+
+    @PUT
+    @Path("/functions/{functionName}/configuration")
+    public Response updateFunctionConfiguration(@Context HttpHeaders headers,
+                                                @PathParam("functionName") String functionName,
+                                                String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            LambdaFunction fn = lambdaService.updateFunctionConfiguration(region, functionName, request);
+            return Response.ok(buildFunctionConfiguration(fn)).build();
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InvalidParameterValueException", e.getMessage(), 400);
+        }
     }
 
     // ──────────────────────────── UpdateFunctionCode ────────────────────────────
@@ -166,6 +195,10 @@ public class LambdaController {
 
     // ──────────────────────────── Invoke ────────────────────────────
 
+    private static final int SYNC_REQUEST_LIMIT  = 6 * 1024 * 1024;
+    private static final int ASYNC_REQUEST_LIMIT = 1 * 1024 * 1024;
+    private static final int SYNC_RESPONSE_LIMIT = 6 * 1024 * 1024;
+
     @POST
     @Path("/functions/{functionName}/invocations")
     @Consumes(MediaType.WILDCARD)
@@ -176,7 +209,30 @@ public class LambdaController {
         String invocationTypeHeader = headers.getHeaderString("X-Amz-Invocation-Type");
         InvocationType type = InvocationType.parse(invocationTypeHeader);
 
+        int payloadSize = payload != null ? payload.length : 0;
+        if (type == InvocationType.Event && payloadSize > ASYNC_REQUEST_LIMIT) {
+            return Response.status(413)
+                    .type(MediaType.APPLICATION_JSON)
+                    .entity("{\"__type\":\"RequestTooLargeException\",\"message\":\"The request payload exceeded the Invoke request body JSON input quota.\"}")
+                    .build();
+        }
+        if (type != InvocationType.Event && payloadSize > SYNC_REQUEST_LIMIT) {
+            return Response.status(413)
+                    .type(MediaType.APPLICATION_JSON)
+                    .entity("{\"__type\":\"RequestTooLargeException\",\"message\":\"The request payload exceeded the Invoke request body JSON input quota.\"}")
+                    .build();
+        }
+
         InvokeResult result = lambdaService.invoke(region, functionName, payload, type);
+
+        if (type != InvocationType.Event
+                && result.getPayload() != null
+                && result.getPayload().length > SYNC_RESPONSE_LIMIT) {
+            return Response.status(413)
+                    .type(MediaType.APPLICATION_JSON)
+                    .entity("{\"__type\":\"RequestTooLargeException\",\"message\":\"The response payload exceeded the maximum allowed payload size (6 MB).\"}")
+                    .build();
+        }
 
         Response.ResponseBuilder builder = Response.status(result.getStatusCode());
 
@@ -269,6 +325,14 @@ public class LambdaController {
         if (esm.getFunctionResponseTypes() != null) {
             esm.getFunctionResponseTypes().forEach(responseTypes::add);
         }
+        // Only emit ScalingConfig when a cap is actually set — AWS omits the
+        // field entirely on mappings with no MaximumConcurrency rather than
+        // returning an empty object.
+        Integer maxConcurrency = esm.getMaximumConcurrency();
+        if (maxConcurrency != null) {
+            ObjectNode scaling = node.putObject("ScalingConfig");
+            scaling.put("MaximumConcurrency", maxConcurrency.intValue());
+        }
         @SuppressWarnings("unchecked")
         Map<String, Object> result = objectMapper.convertValue(node, Map.class);
         return result;
@@ -322,7 +386,9 @@ public class LambdaController {
             String name = (String) req.get("Name");
             String functionVersion = (String) req.get("FunctionVersion");
             String description = (String) req.get("Description");
-            LambdaAlias alias = lambdaService.createAlias(region, functionName, name, functionVersion, description);
+            @SuppressWarnings("unchecked")
+            Map<String, Double> routingConfig = extractRoutingConfig((Map<String, Object>) req.get("RoutingConfig"));
+            LambdaAlias alias = lambdaService.createAlias(region, functionName, name, functionVersion, description, routingConfig);
             return Response.status(201).entity(buildAliasResponse(alias)).build();
         } catch (AwsException e) {
             throw e;
@@ -367,7 +433,9 @@ public class LambdaController {
             Map<String, Object> req = objectMapper.readValue(body, Map.class);
             String functionVersion = (String) req.get("FunctionVersion");
             String description = (String) req.get("Description");
-            LambdaAlias alias = lambdaService.updateAlias(region, functionName, aliasName, functionVersion, description);
+            @SuppressWarnings("unchecked")
+            Map<String, Double> routingConfig = extractRoutingConfig((Map<String, Object>) req.get("RoutingConfig"));
+            LambdaAlias alias = lambdaService.updateAlias(region, functionName, aliasName, functionVersion, description, routingConfig);
             return Response.ok(buildAliasResponse(alias)).build();
         } catch (AwsException e) {
             throw e;
@@ -449,8 +517,25 @@ public class LambdaController {
         node.put("AliasArn", alias.getAliasArn());
         if (alias.getDescription() != null) node.put("Description", alias.getDescription());
         node.put("RevisionId", alias.getRevisionId());
+        if (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty()) {
+            ObjectNode rc = node.putObject("RoutingConfig");
+            ObjectNode weights = rc.putObject("AdditionalVersionWeights");
+            alias.getRoutingConfig().forEach(weights::put);
+        }
         @SuppressWarnings("unchecked")
         Map<String, Object> result = objectMapper.convertValue(node, Map.class);
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Double> extractRoutingConfig(Map<String, Object> rc) {
+        if (rc == null) return null;
+        Object weights = rc.get("AdditionalVersionWeights");
+        if (!(weights instanceof Map)) return null;
+        Map<String, Object> raw = (Map<String, Object>) weights;
+        if (raw.isEmpty()) return null;
+        java.util.Map<String, Double> result = new java.util.HashMap<>();
+        raw.forEach((k, v) -> result.put(k, ((Number) v).doubleValue()));
         return result;
     }
 
@@ -468,14 +553,60 @@ public class LambdaController {
         if (fn.getStateReason() != null) node.put("StateReason", fn.getStateReason());
         if (fn.getStateReasonCode() != null) node.put("StateReasonCode", fn.getStateReasonCode());
         node.put("CodeSize", fn.getCodeSizeBytes());
+        node.put("CodeSha256", fn.getCodeSha256() != null ? fn.getCodeSha256() : "");
         node.put("PackageType", fn.getPackageType());
         if (fn.getImageUri() != null) node.put("ImageUri", fn.getImageUri());
-        node.put("LastModified", String.valueOf(fn.getLastModified()));
+        if ("Image".equals(fn.getPackageType())) {
+            ObjectNode imageConfig = node.putObject("ImageConfigResponse").putObject("ImageConfig");
+            if (fn.getImageConfigCommand() != null && !fn.getImageConfigCommand().isEmpty()) {
+                ArrayNode cmdNode = imageConfig.putArray("Command");
+                fn.getImageConfigCommand().forEach(cmdNode::add);
+            }
+            if (fn.getImageConfigEntryPoint() != null && !fn.getImageConfigEntryPoint().isEmpty()) {
+                ArrayNode epNode = imageConfig.putArray("EntryPoint");
+                fn.getImageConfigEntryPoint().forEach(epNode::add);
+            }
+            if (fn.getImageConfigWorkingDirectory() != null && !fn.getImageConfigWorkingDirectory().isBlank()) {
+                imageConfig.put("WorkingDirectory", fn.getImageConfigWorkingDirectory());
+            }
+        }
+        node.put("LastModified", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
+                .format(Instant.ofEpochMilli(fn.getLastModified()).atOffset(ZoneOffset.UTC)));
         node.put("RevisionId", fn.getRevisionId());
         node.put("Version", fn.getVersion());
+        node.put("LastUpdateStatus", "Successful");
 
+        // Architectures — always present; default x86_64
+        ArrayNode archNode = node.putArray("Architectures");
+        List<String> archs = fn.getArchitectures();
+        (archs != null && !archs.isEmpty() ? archs : List.of("x86_64")).forEach(archNode::add);
+
+        // EphemeralStorage — always present; AWS default 512 MB
+        node.putObject("EphemeralStorage").put("Size", fn.getEphemeralStorageSize());
+
+        // TracingConfig — always present
+        node.putObject("TracingConfig")
+                .put("Mode", fn.getTracingMode() != null ? fn.getTracingMode() : "PassThrough");
+
+        // DeadLetterConfig — only when set
+        if (fn.getDeadLetterTargetArn() != null) {
+            node.putObject("DeadLetterConfig").put("TargetArn", fn.getDeadLetterTargetArn());
+        }
+
+        // Layers — only when non-empty
+        if (fn.getLayers() != null && !fn.getLayers().isEmpty()) {
+            ArrayNode layersNode = node.putArray("Layers");
+            fn.getLayers().forEach(arn -> layersNode.addObject().put("Arn", arn));
+        }
+
+        // KMSKeyArn — only when set
+        if (fn.getKmsKeyArn() != null) {
+            node.put("KMSKeyArn", fn.getKmsKeyArn());
+        }
+
+        // Environment — always present (SDK expects it even when empty)
+        ObjectNode envNode = node.putObject("Environment");
         if (fn.getEnvironment() != null && !fn.getEnvironment().isEmpty()) {
-            ObjectNode envNode = node.putObject("Environment");
             ObjectNode vars = envNode.putObject("Variables");
             fn.getEnvironment().forEach(vars::put);
         }

@@ -15,15 +15,9 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
-      - '.mvn/**'
-      - 'mvnw'
-      - 'mvnw.cmd'
-      - 'Dockerfile'
-      - 'Dockerfile.jvm-package'
-      - 'Dockerfile.native'
-      - 'Dockerfile.native-package'
+      - 'docker/Dockerfile.native-package'
+      - 'docker/Dockerfile.compat'
       - 'docker-compose.yml'
-      - 'docker-compose-test.yml'
       - '.releaserc.json'
       - '.github/workflows/semver.yml'
 

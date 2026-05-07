@@ -1,12 +1,14 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsJsonController;
 import io.github.hectorvent.floci.services.dynamodb.model.*;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -22,31 +24,16 @@ public class DynamoDbJsonHandler {
 
     private final DynamoDbService dynamoDbService;
     private final DynamoDbStreamService dynamoDbStreamService;
+    private final KinesisService kinesisService;
     private final ObjectMapper objectMapper;
 
     @Inject
     public DynamoDbJsonHandler(DynamoDbService dynamoDbService, DynamoDbStreamService dynamoDbStreamService,
-                               ObjectMapper objectMapper) {
+                               KinesisService kinesisService, ObjectMapper objectMapper) {
         this.dynamoDbService = dynamoDbService;
         this.dynamoDbStreamService = dynamoDbStreamService;
+        this.kinesisService = kinesisService;
         this.objectMapper = objectMapper;
-    }
-
-    /**
-     * Builds a ConsumedCapacity node if the request asks for it via ReturnConsumedCapacity.
-     * Returns null if not requested (i.e. NONE or absent).
-     */
-    private ObjectNode buildConsumedCapacity(JsonNode request) {
-        String rcc = request.has("ReturnConsumedCapacity")
-                ? request.get("ReturnConsumedCapacity").asText("NONE") : "NONE";
-        if ("NONE".equals(rcc)) return null;
-        ObjectNode cc = objectMapper.createObjectNode();
-        cc.put("TableName", request.path("TableName").asText());
-        cc.put("CapacityUnits", 1.0);
-        ObjectNode table = objectMapper.createObjectNode();
-        table.put("CapacityUnits", 1.0);
-        cc.set("Table", table);
-        return cc;
     }
 
     private static final org.jboss.logging.Logger LOG = org.jboss.logging.Logger.getLogger(DynamoDbJsonHandler.class);
@@ -73,11 +60,19 @@ public class DynamoDbJsonHandler {
             case "UpdateTable" -> handleUpdateTable(request, region);
             case "DescribeTimeToLive" -> handleDescribeTimeToLive(request, region);
             case "UpdateTimeToLive" -> handleUpdateTimeToLive(request, region);
+            case "DescribeContinuousBackups" -> handleDescribeContinuousBackups(request, region);
+            case "UpdateContinuousBackups" -> handleUpdateContinuousBackups(request, region);
             case "TransactWriteItems" -> handleTransactWriteItems(request, region);
             case "TransactGetItems" -> handleTransactGetItems(request, region);
             case "TagResource" -> handleTagResource(request, region);
             case "UntagResource" -> handleUntagResource(request, region);
             case "ListTagsOfResource" -> handleListTagsOfResource(request, region);
+            case "EnableKinesisStreamingDestination" -> handleEnableKinesisStreamingDestination(request, region);
+            case "DisableKinesisStreamingDestination" -> handleDisableKinesisStreamingDestination(request, region);
+            case "DescribeKinesisStreamingDestination" -> handleDescribeKinesisStreamingDestination(request, region);
+            case "ExportTableToPointInTime" -> handleExportTable(request, region);
+            case "DescribeExport" -> handleDescribeExport(request, region);
+            case "ListExports" -> handleListExports(request, region);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnknownOperationException", "Operation " + action + " is not supported."))
                     .build();
@@ -86,7 +81,7 @@ public class DynamoDbJsonHandler {
     }
 
     private Response handleCreateTable(JsonNode request, String region) {
-        String tableName = request.path("TableName").asText();
+        String tableName = DynamoDbTableNames.requireShortName(request.path("TableName").asText());
 
         List<KeySchemaElement> keySchema = new ArrayList<>();
         request.path("KeySchema").forEach(ks ->
@@ -154,8 +149,12 @@ public class DynamoDbJsonHandler {
         String billingMode = request.has("BillingMode")
                 ? request.get("BillingMode").asText() : null;
 
+        boolean deletionProtection = request.path("DeletionProtectionEnabled").asBoolean(false);
+
         TableDefinition table = dynamoDbService.createTable(tableName, keySchema, attrDefs,
                 readCapacity, writeCapacity, gsis, lsis, region);
+
+        table.setDeletionProtectionEnabled(deletionProtection);
 
         if ("PAY_PER_REQUEST".equals(billingMode)) {
             table.setBillingMode("PAY_PER_REQUEST");
@@ -191,6 +190,10 @@ public class DynamoDbJsonHandler {
     private Response handleDeleteTable(JsonNode request, String region) {
         String tableName = request.path("TableName").asText();
         TableDefinition table = dynamoDbService.describeTable(tableName, region);
+        if (table.isDeletionProtectionEnabled()) {
+            throw new AwsException("ResourceInUseException",
+                    "Table " + tableName + " can't be deleted while DeletionProtectionEnabled is set to true", 400);
+        }
         dynamoDbService.deleteTable(tableName, region);
 
         table.setTableStatus("DELETING");
@@ -222,6 +225,7 @@ public class DynamoDbJsonHandler {
         String tableName = request.path("TableName").asText();
         JsonNode item = request.path("Item");
         String returnValues = request.path("ReturnValues").asText("NONE");
+        String returnValuesOnConditionCheckFailure = request.path("ReturnValuesOnConditionCheckFailure").asText("NONE");
         String conditionExpression = request.has("ConditionExpression")
                 ? request.get("ConditionExpression").asText() : null;
         JsonNode exprAttrNames = request.has("ExpressionAttributeNames")
@@ -264,14 +268,13 @@ public class DynamoDbJsonHandler {
             oldItem = dynamoDbService.getItem(tableName, item, region);
         }
 
-        dynamoDbService.putItem(tableName, item, conditionExpression, exprAttrNames, exprAttrValues, region);
+        dynamoDbService.putItem(tableName, item, conditionExpression, exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure);
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
             response.set("Attributes", oldItem);
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, 1, true);
         return Response.ok(response).build();
     }
 
@@ -285,15 +288,15 @@ public class DynamoDbJsonHandler {
         if (item != null) {
             response.set("Item", item);
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, item != null ? 1 : 0, false);
         return Response.ok(response).build();
     }
 
     private Response handleDeleteItem(JsonNode request, String region) {
         String tableName = request.path("TableName").asText();
         JsonNode key = request.path("Key");
-        String returnValues = request.path("ReturnValues").asText("NONE");
+        String returnValues = request.path("ReturnValues").asText("NONE");        
+        String returnValuesOnConditionCheckFailure = request.path("ReturnValuesOnConditionCheckFailure").asText("NONE");
         String conditionExpression = request.has("ConditionExpression")
                 ? request.get("ConditionExpression").asText() : null;
         JsonNode exprAttrNames = request.has("ExpressionAttributeNames")
@@ -302,14 +305,13 @@ public class DynamoDbJsonHandler {
                 ? request.get("ExpressionAttributeValues") : null;
 
         JsonNode oldItem = dynamoDbService.deleteItem(tableName, key, conditionExpression,
-                exprAttrNames, exprAttrValues, region);
+                exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure);
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
             response.set("Attributes", oldItem);
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, 1, true);
         return Response.ok(response).build();
     }
 
@@ -363,22 +365,51 @@ public class DynamoDbJsonHandler {
         }
 
         String returnValues = request.path("ReturnValues").asText("NONE");
+        String returnValuesOnConditionCheckFailure = request.path("ReturnValuesOnConditionCheckFailure").asText("NONE");
 
         JsonNode updateData = attributeUpdates.isMissingNode() ? null : attributeUpdates;
 
         DynamoDbService.UpdateResult result = dynamoDbService.updateItem(
                 tableName, key, updateData, updateExpression, exprAttrNames, exprAttrValues,
-                returnValues, conditionExpression, region);
+                returnValues, conditionExpression, region, returnValuesOnConditionCheckFailure);
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("ALL_NEW" .equals(returnValues) && result.newItem() != null) {
             response.set("Attributes", result.newItem());
         } else if ("ALL_OLD" .equals(returnValues) && result.oldItem() != null) {
             response.set("Attributes", result.oldItem());
+        } else if ("UPDATED_NEW".equals(returnValues) && result.newItem() != null) {
+            // When oldItem is null (new item created), diff against the key so key
+            // attributes are excluded - matching AWS behavior where UPDATED_NEW
+            // returns only the attributes set by the expression.
+            JsonNode baseline = result.oldItem() != null ? result.oldItem() : key;
+            response.set("Attributes", getChangedAttributes(result.newItem(), baseline));
+        } else if ("UPDATED_OLD".equals(returnValues) && result.oldItem() != null) {
+            response.set("Attributes", getChangedAttributes(result.oldItem(), result.newItem()));
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, 1, true);
         return Response.ok(response).build();
+    }
+
+    private JsonNode getChangedAttributes(JsonNode preferredItem, JsonNode secondaryItem){
+        ObjectNode changedAttributes = objectMapper.createObjectNode();
+        Iterator<Map.Entry<String, JsonNode>> fields = preferredItem.fields();
+        while (fields.hasNext()) {
+            var entry = fields.next();
+            String attrName = entry.getKey();
+            JsonNode value = entry.getValue();
+
+            if (secondaryItem.has(attrName)){
+                JsonNode secondaryValue = secondaryItem.get(attrName);
+                if (!value.equals(secondaryValue)){
+                    changedAttributes.put(attrName, value);
+                }
+            }
+            else {
+                changedAttributes.put(attrName, value);
+            }
+        }
+        return changedAttributes;
     }
 
     private Response handleQuery(JsonNode request, String region) {
@@ -418,8 +449,7 @@ public class DynamoDbJsonHandler {
         if (result.lastEvaluatedKey() != null) {
             response.set("LastEvaluatedKey", result.lastEvaluatedKey());
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, result.items().size(), false);
         return Response.ok(response).build();
     }
 
@@ -449,8 +479,7 @@ public class DynamoDbJsonHandler {
         if (result.lastEvaluatedKey() != null) {
             response.set("LastEvaluatedKey", result.lastEvaluatedKey());
         }
-        ObjectNode cc = buildConsumedCapacity(request);
-        if (cc != null) response.set("ConsumedCapacity", cc);
+        addConsumedCapacity(response, request, tableName, result.items().size(), false);
         return Response.ok(response).build();
     }
 
@@ -475,6 +504,7 @@ public class DynamoDbJsonHandler {
 
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UnprocessedItems", objectMapper.createObjectNode());
+        addBatchConsumedCapacity(response, request, items, true);
         return Response.ok(response).build();
     }
 
@@ -504,6 +534,7 @@ public class DynamoDbJsonHandler {
         }
         response.set("Responses", responses);
         response.set("UnprocessedKeys", objectMapper.createObjectNode());
+        addBatchConsumedCapacity(response, request, items, false);
         return Response.ok(response).build();
     }
 
@@ -566,6 +597,11 @@ public class DynamoDbJsonHandler {
         TableDefinition table = dynamoDbService.updateTable(tableName, readCapacity, writeCapacity,
                 gsiCreates, gsiDeletes, newAttrDefs, region);
 
+        JsonNode deletionProtectionNode = request.path("DeletionProtectionEnabled");
+        if (!deletionProtectionNode.isMissingNode()) {
+            table.setDeletionProtectionEnabled(deletionProtectionNode.asBoolean());
+        }
+
         String billingMode = request.has("BillingMode")
                 ? request.get("BillingMode").asText() : null;
         if (billingMode != null) {
@@ -582,12 +618,12 @@ public class DynamoDbJsonHandler {
             if (streamEnabled) {
                 String viewType = streamSpec.path("StreamViewType").asText("NEW_AND_OLD_IMAGES");
                 StreamDescription sd = dynamoDbStreamService.enableStream(
-                        tableName, table.getTableArn(), viewType, region);
+                        table.getTableName(), table.getTableArn(), viewType, region);
                 table.setStreamEnabled(true);
                 table.setStreamArn(sd.getStreamArn());
                 table.setStreamViewType(viewType);
             } else {
-                dynamoDbStreamService.disableStream(tableName, region);
+                dynamoDbStreamService.disableStream(table.getTableName(), region);
                 table.setStreamEnabled(false);
             }
         }
@@ -626,6 +662,35 @@ public class DynamoDbJsonHandler {
         ttlSpec.put("AttributeName", ttlAttributeName);
         ttlSpec.put("Enabled", enabled);
         response.set("TimeToLiveSpecification", ttlSpec);
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeContinuousBackups(JsonNode request, String region) {
+        String tableName = request.path("TableName").asText();
+        TableDefinition table = dynamoDbService.describeTable(tableName, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ContinuousBackupsDescription", continuousBackupsDescriptionNode(table));
+        return Response.ok(response).build();
+    }
+
+    private Response handleUpdateContinuousBackups(JsonNode request, String region) {
+        String tableName = request.path("TableName").asText();
+        JsonNode spec = request.path("PointInTimeRecoverySpecification");
+        boolean enabled = spec.path("PointInTimeRecoveryEnabled").asBoolean(false);
+        Integer recoveryPeriodInDays = spec.has("RecoveryPeriodInDays")
+                ? spec.path("RecoveryPeriodInDays").asInt()
+                : null;
+        if (recoveryPeriodInDays != null && (recoveryPeriodInDays < 1 || recoveryPeriodInDays > 35)) {
+            throw new AwsException("ValidationException",
+                    "RecoveryPeriodInDays must be between 1 and 35", 400);
+        }
+
+        TableDefinition table = dynamoDbService.updateContinuousBackups(
+                tableName, enabled, recoveryPeriodInDays, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ContinuousBackupsDescription", continuousBackupsDescriptionNode(table));
         return Response.ok(response).build();
     }
 
@@ -718,6 +783,161 @@ public class DynamoDbJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleEnableKinesisStreamingDestination(JsonNode request, String region) {
+        String tableName = request.path("TableName").asText();
+        String streamArn = request.path("StreamArn").asText();
+
+        TableDefinition table = dynamoDbService.describeTable(tableName, region);
+        String resolvedTableName = table.getTableName();
+
+        String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
+        try {
+            kinesisService.describeStream(streamName, region);
+        } catch (AwsException e) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Kinesis stream not found: " + streamArn, 400);
+        }
+
+        Optional<KinesisStreamingDestination> existing = table.findKinesisStreamingDestination(streamArn);
+        if (existing.isPresent() && "ACTIVE".equals(existing.get().getDestinationStatus())) {
+            throw new AwsException("ValidationException",
+                    "Table already has an active Kinesis streaming destination with this stream ARN", 400);
+        }
+
+        if (existing.isPresent()) {
+            existing.get().setDestinationStatus("ACTIVE");
+            existing.get().setDestinationStatusDescription("Kinesis streaming is enabled for this table");
+        } else {
+            table.getKinesisStreamingDestinations().add(new KinesisStreamingDestination(streamArn));
+        }
+
+        if (!table.isStreamEnabled()) {
+            StreamDescription sd = dynamoDbStreamService.enableStream(
+                    resolvedTableName, table.getTableArn(), "NEW_AND_OLD_IMAGES", region);
+            table.setStreamEnabled(true);
+            table.setStreamArn(sd.getStreamArn());
+            table.setStreamViewType("NEW_AND_OLD_IMAGES");
+        }
+
+        dynamoDbService.persistTable(resolvedTableName, table, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("TableName", resolvedTableName);
+        response.put("StreamArn", streamArn);
+        response.put("DestinationStatus", "ACTIVE");
+        response.put("DestinationStatusDescription", "Kinesis streaming is enabled for this table");
+        return Response.ok(response).build();
+    }
+
+    private Response handleDisableKinesisStreamingDestination(JsonNode request, String region) {
+        String tableName = request.path("TableName").asText();
+        String streamArn = request.path("StreamArn").asText();
+
+        TableDefinition table = dynamoDbService.describeTable(tableName, region);
+        String resolvedTableName = table.getTableName();
+
+        Optional<KinesisStreamingDestination> existing = table.findKinesisStreamingDestination(streamArn);
+        if (existing.isEmpty()) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Kinesis streaming destination not found for stream: " + streamArn, 400);
+        }
+
+        if ("DISABLED".equals(existing.get().getDestinationStatus())) {
+            throw new AwsException("ValidationException",
+                    "Kinesis streaming destination is already disabled for stream: " + streamArn, 400);
+        }
+
+        existing.get().setDestinationStatus("DISABLED");
+        existing.get().setDestinationStatusDescription("Kinesis streaming is disabled for this table");
+        dynamoDbService.persistTable(resolvedTableName, table, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("TableName", resolvedTableName);
+        response.put("StreamArn", streamArn);
+        response.put("DestinationStatus", "DISABLED");
+        response.put("DestinationStatusDescription", "Kinesis streaming is disabled for this table");
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeKinesisStreamingDestination(JsonNode request, String region) {
+        String tableName = request.path("TableName").asText();
+        TableDefinition table = dynamoDbService.describeTable(tableName, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("TableName", table.getTableName());
+
+        ArrayNode destinations = objectMapper.createArrayNode();
+        for (KinesisStreamingDestination dest : table.getKinesisStreamingDestinations()) {
+            ObjectNode destNode = objectMapper.createObjectNode();
+            destNode.put("StreamArn", dest.getStreamArn());
+            destNode.put("DestinationStatus", dest.getDestinationStatus());
+            destNode.put("DestinationStatusDescription", dest.getDestinationStatusDescription());
+            destNode.put("ApproximateCreationDateTimePrecision",
+                    dest.getApproximateCreationDateTimePrecision());
+            destinations.add(destNode);
+        }
+        response.set("KinesisDataStreamDestinations", destinations);
+        return Response.ok(response).build();
+    }
+
+    /**
+     * Builds a ConsumedCapacity node if the request includes ReturnConsumedCapacity.
+     * Uses simple estimates: 0.5 RCU per item read, 1.0 WCU per item written.
+     */
+    private void addConsumedCapacity(ObjectNode response, JsonNode request, String tableName,
+                                      int itemCount, boolean isWrite) {
+        String returnCC = request.path("ReturnConsumedCapacity").asText("NONE");
+        if ("NONE".equals(returnCC)) return;
+
+        double cu = isWrite ? Math.max(1.0, itemCount) : Math.max(0.5, itemCount * 0.5);
+
+        ObjectNode cc = objectMapper.createObjectNode();
+        cc.put("TableName", DynamoDbTableNames.resolve(tableName));
+        cc.put("CapacityUnits", cu);
+
+        if ("INDEXES".equals(returnCC)) {
+            ObjectNode tableCap = objectMapper.createObjectNode();
+            String indexName = request.path("IndexName").asText(null);
+            if (indexName != null) {
+                tableCap.put("CapacityUnits", 0.0);
+                cc.set("Table", tableCap);
+                ObjectNode gsiCaps = objectMapper.createObjectNode();
+                ObjectNode indexCap = objectMapper.createObjectNode();
+                indexCap.put("CapacityUnits", cu);
+                gsiCaps.set(indexName, indexCap);
+                cc.set("GlobalSecondaryIndexes", gsiCaps);
+            } else {
+                tableCap.put("CapacityUnits", cu);
+                cc.set("Table", tableCap);
+            }
+        }
+
+        response.set("ConsumedCapacity", cc);
+    }
+
+    /**
+     * Builds a list-style ConsumedCapacity for batch operations.
+     */
+    private void addBatchConsumedCapacity(ObjectNode response, JsonNode request,
+                                           Map<String, ?> tableItems, boolean isWrite) {
+        String returnCC = request.path("ReturnConsumedCapacity").asText("NONE");
+        if ("NONE".equals(returnCC)) return;
+
+        ArrayNode ccArray = objectMapper.createArrayNode();
+        for (String tableName : tableItems.keySet()) {
+            ObjectNode cc = objectMapper.createObjectNode();
+            cc.put("TableName", DynamoDbTableNames.resolve(tableName));
+            cc.put("CapacityUnits", isWrite ? 1.0 : 0.5);
+            if ("INDEXES".equals(returnCC)) {
+                ObjectNode tableCap = objectMapper.createObjectNode();
+                tableCap.put("CapacityUnits", isWrite ? 1.0 : 0.5);
+                cc.set("Table", tableCap);
+            }
+            ccArray.add(cc);
+        }
+        response.set("ConsumedCapacity", ccArray);
+    }
+
     private ObjectNode tableToNode(TableDefinition table) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("TableName", table.getTableName());
@@ -726,7 +946,7 @@ public class DynamoDbJsonHandler {
         node.put("CreationDateTime", table.getCreationDateTime().getEpochSecond());
         node.put("ItemCount", table.getItemCount());
         node.put("TableSizeBytes", table.getTableSizeBytes());
-        node.put("DeletionProtectionEnabled", false);
+        node.put("DeletionProtectionEnabled", table.isDeletionProtectionEnabled());
 
         if ("PAY_PER_REQUEST".equals(table.getBillingMode())) {
             ObjectNode billing = objectMapper.createObjectNode();
@@ -852,5 +1072,62 @@ public class DynamoDbJsonHandler {
         }
 
         return node;
+    }
+
+    private ObjectNode continuousBackupsDescriptionNode(TableDefinition table) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ContinuousBackupsStatus", "ENABLED");
+
+        ObjectNode pitrNode = objectMapper.createObjectNode();
+        pitrNode.put("PointInTimeRecoveryStatus",
+                table.isPointInTimeRecoveryEnabled() ? "ENABLED" : "DISABLED");
+        if (table.isPointInTimeRecoveryEnabled()) {
+            pitrNode.put("RecoveryPeriodInDays", table.getPointInTimeRecoveryRecoveryPeriodInDays());
+        }
+        node.set("PointInTimeRecoveryDescription", pitrNode);
+        return node;
+    }
+
+    private Response handleExportTable(JsonNode request, String region) {
+        Map<String, Object> params = new java.util.HashMap<>();
+        request.fields().forEachRemaining(e -> params.put(e.getKey(), e.getValue().isTextual()
+                ? e.getValue().asText() : e.getValue()));
+
+        io.github.hectorvent.floci.services.dynamodb.model.ExportDescription desc =
+                dynamoDbService.exportTable(params, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ExportDescription", objectMapper.valueToTree(desc));
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeExport(JsonNode request, String region) {
+        String exportArn = request.path("ExportArn").asText();
+        io.github.hectorvent.floci.services.dynamodb.model.ExportDescription desc =
+                dynamoDbService.describeExport(exportArn);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ExportDescription", objectMapper.valueToTree(desc));
+        return Response.ok(response).build();
+    }
+
+    private Response handleListExports(JsonNode request, String region) {
+        String tableArn = request.has("TableArn") ? request.get("TableArn").asText() : null;
+        Integer maxResults = request.has("MaxResults") ? request.get("MaxResults").asInt() : null;
+        String nextToken = request.has("NextToken") && !request.get("NextToken").isNull()
+                ? request.get("NextToken").asText() : null;
+
+        DynamoDbService.ListExportsResult result = dynamoDbService.listExports(tableArn, maxResults, nextToken);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode summaries = objectMapper.createArrayNode();
+        for (io.github.hectorvent.floci.services.dynamodb.model.ExportSummary s : result.exportSummaries()) {
+            summaries.add(objectMapper.valueToTree(s));
+        }
+        response.set("ExportSummaries", summaries);
+        if (result.nextToken() != null) {
+            response.put("NextToken", result.nextToken());
+        }
+        return Response.ok(response).build();
     }
 }

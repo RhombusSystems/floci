@@ -36,6 +36,23 @@ teardown() {
     [ "$name" = "$TABLE_NAME" ]
 }
 
+@test "DynamoDB: describe table by ARN" {
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    table_arn="arn:aws:dynamodb:${AWS_REGION:-us-east-1}:000000000000:table/$TABLE_NAME"
+
+    run aws_cmd dynamodb describe-table --table-name "$table_arn"
+    assert_success
+    name=$(json_get "$output" '.Table.TableName')
+    [ "$name" = "$TABLE_NAME" ]
+}
+
 @test "DynamoDB: list tables" {
     aws_cmd dynamodb create-table \
         --table-name "$TABLE_NAME" \
@@ -168,6 +185,34 @@ teardown() {
 
     run aws_cmd dynamodb delete-table --table-name "$TABLE_NAME"
     assert_success
+}
+
+@test "DynamoDB: update and describe continuous backups" {
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    run aws_cmd dynamodb describe-continuous-backups --table-name "$TABLE_NAME"
+    assert_success
+    status=$(json_get "$output" '.ContinuousBackupsDescription.ContinuousBackupsStatus')
+    [ "$status" = "ENABLED" ]
+    pitr_status=$(json_get "$output" '.ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus')
+    [ "$pitr_status" = "DISABLED" ]
+    missing_period=$(echo "$output" | jq '.ContinuousBackupsDescription.PointInTimeRecoveryDescription | has("RecoveryPeriodInDays")')
+    [ "$missing_period" = "false" ]
+
+    run aws_cmd dynamodb update-continuous-backups \
+        --table-name "$TABLE_NAME" \
+        --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true
+    assert_success
+    updated_status=$(json_get "$output" '.ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus')
+    [ "$updated_status" = "ENABLED" ]
+    recovery_period=$(json_get "$output" '.ContinuousBackupsDescription.PointInTimeRecoveryDescription.RecoveryPeriodInDays')
+    [ "$recovery_period" = "35" ]
 }
 
 # --- DynamoDB GSI/LSI Tests ---
@@ -575,6 +620,95 @@ teardown() {
     [ "$count" = "1" ]
 }
 
+# --- DynamoDB Kinesis Streaming Destination Tests ---
+
+@test "DynamoDB: enable kinesis streaming destination" {
+    STREAM_NAME="bats-kinesis-$(unique_name)"
+
+    aws_cmd kinesis create-stream --stream-name "$STREAM_NAME" --shard-count 1 >/dev/null
+
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST \
+        --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    STREAM_ARN=$(aws_cmd kinesis describe-stream-summary --stream-name "$STREAM_NAME" | jq -r '.StreamDescriptionSummary.StreamARN')
+
+    run aws_cmd dynamodb enable-kinesis-streaming-destination \
+        --table-name "$TABLE_NAME" \
+        --stream-arn "$STREAM_ARN"
+    assert_success
+    status=$(json_get "$output" '.DestinationStatus')
+    [ "$status" = "ACTIVE" ]
+
+    aws_cmd kinesis delete-stream --stream-name "$STREAM_NAME" >/dev/null 2>&1 || true
+}
+
+@test "DynamoDB: describe kinesis streaming destination" {
+    STREAM_NAME="bats-kinesis-$(unique_name)"
+
+    aws_cmd kinesis create-stream --stream-name "$STREAM_NAME" --shard-count 1 >/dev/null
+
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST \
+        --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    STREAM_ARN=$(aws_cmd kinesis describe-stream-summary --stream-name "$STREAM_NAME" | jq -r '.StreamDescriptionSummary.StreamARN')
+
+    aws_cmd dynamodb enable-kinesis-streaming-destination \
+        --table-name "$TABLE_NAME" \
+        --stream-arn "$STREAM_ARN" >/dev/null
+
+    run aws_cmd dynamodb describe-kinesis-streaming-destination \
+        --table-name "$TABLE_NAME"
+    assert_success
+    count=$(echo "$output" | jq '.KinesisDataStreamDestinations | length')
+    [ "$count" = "1" ]
+    dest_status=$(echo "$output" | jq -r '.KinesisDataStreamDestinations[0].DestinationStatus')
+    [ "$dest_status" = "ACTIVE" ]
+
+    aws_cmd kinesis delete-stream --stream-name "$STREAM_NAME" >/dev/null 2>&1 || true
+}
+
+@test "DynamoDB: disable kinesis streaming destination" {
+    STREAM_NAME="bats-kinesis-$(unique_name)"
+
+    aws_cmd kinesis create-stream --stream-name "$STREAM_NAME" --shard-count 1 >/dev/null
+
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST \
+        --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    STREAM_ARN=$(aws_cmd kinesis describe-stream-summary --stream-name "$STREAM_NAME" | jq -r '.StreamDescriptionSummary.StreamARN')
+
+    aws_cmd dynamodb enable-kinesis-streaming-destination \
+        --table-name "$TABLE_NAME" \
+        --stream-arn "$STREAM_ARN" >/dev/null
+
+    run aws_cmd dynamodb disable-kinesis-streaming-destination \
+        --table-name "$TABLE_NAME" \
+        --stream-arn "$STREAM_ARN"
+    assert_success
+    status=$(json_get "$output" '.DestinationStatus')
+    [ "$status" = "DISABLED" ]
+
+    aws_cmd kinesis delete-stream --stream-name "$STREAM_NAME" >/dev/null 2>&1 || true
+}
+
 @test "DynamoDB: scan with contains on String Set" {
     aws_cmd dynamodb create-table \
         --table-name "$TABLE_NAME" \
@@ -596,4 +730,39 @@ teardown() {
     assert_success
     count=$(json_get "$output" '.Count')
     [ "$count" = "1" ]
+}
+
+# --- DynamoDB REMOVE nested map key tests (GH #402) ---
+
+@test "DynamoDB: REMOVE key from nested map" {
+    aws_cmd dynamodb create-table \
+        --table-name "$TABLE_NAME" \
+        --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+        --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
+        --billing-mode PAY_PER_REQUEST >/dev/null
+
+    ddb_wait_table "$TABLE_NAME"
+
+    # Set a map attribute with a key
+    aws_cmd dynamodb update-item \
+        --table-name "$TABLE_NAME" \
+        --key '{"pk":{"S":"user1"},"sk":{"S":"sort1"}}' \
+        --update-expression 'SET ratings = :ratings' \
+        --expression-attribute-values '{":ratings":{"M":{"foo":{"S":"5"},"bar":{"S":"3"}}}}' >/dev/null
+
+    # REMOVE ratings.foo
+    aws_cmd dynamodb update-item \
+        --table-name "$TABLE_NAME" \
+        --key '{"pk":{"S":"user1"},"sk":{"S":"sort1"}}' \
+        --update-expression 'REMOVE ratings.foo' >/dev/null
+
+    # Verify foo is removed but bar remains
+    run aws_cmd dynamodb get-item \
+        --table-name "$TABLE_NAME" \
+        --key '{"pk":{"S":"user1"},"sk":{"S":"sort1"}}'
+    assert_success
+    foo=$(echo "$output" | jq -r '.Item.ratings.M.foo // "null"')
+    bar=$(echo "$output" | jq -r '.Item.ratings.M.bar.S')
+    [ "$foo" = "null" ]
+    [ "$bar" = "3" ]
 }

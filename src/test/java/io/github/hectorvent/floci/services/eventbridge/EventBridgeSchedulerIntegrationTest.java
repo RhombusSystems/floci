@@ -5,7 +5,10 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.services.eventbridge.model.Archive;
+import io.github.hectorvent.floci.services.eventbridge.model.ArchivedEvent;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
+import io.github.hectorvent.floci.services.eventbridge.model.Replay;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
@@ -40,10 +43,12 @@ class EventBridgeSchedulerIntegrationTest {
         EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), createConfig());
         scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), invoker);
 
+        ReplayDispatcher replayDispatcher = new ReplayDispatcher(vertx);
         eventBridgeService = new EventBridgeService(
                 busStore, ruleStore, targetStore,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new RegionResolver(REGION, ACCOUNT),
-                new ObjectMapper(), scheduler, invoker);
+                new ObjectMapper(), scheduler, invoker, replayDispatcher);
     }
 
     @AfterEach
@@ -276,6 +281,8 @@ class EventBridgeSchedulerIntegrationTest {
     private EmulatorConfig createConfig() {
         return new EmulatorConfig() {
             @Override
+            public int port() { return 4566; }
+            @Override
             public String baseUrl() { return "http://localhost:4566"; }
             @Override
             public Optional<String> hostname() { return Optional.empty(); }
@@ -292,9 +299,13 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public StorageConfig storage() { return null; }
             @Override
+            public DnsConfig dns() { return Optional::empty; }
+            @Override
             public AuthConfig auth() { return null; }
             @Override
             public ServicesConfig services() { return null; }
+            @Override
+            public DockerConfig docker() { return null; }
             @Override
             public EmulatorConfig.InitHooksConfig initHooks() { return null; }
         };

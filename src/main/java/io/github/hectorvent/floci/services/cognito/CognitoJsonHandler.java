@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
+import io.github.hectorvent.floci.services.cognito.model.UserPoolClientSecret;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -37,27 +38,35 @@ public class CognitoJsonHandler {
             case "DescribeUserPool" -> handleDescribeUserPool(request);
             case "ListUserPools" -> handleListUserPools(request);
             case "UpdateUserPool" -> handleUpdateUserPool(request, region);
+            case "TagResource" -> handleTagResource(request);
+            case "UntagResource" -> handleUntagResource(request);
+            case "ListTagsForResource" -> handleListTagsForResource(request);
             case "GetUserPoolMfaConfig" -> handleGetUserPoolMfaConfig(request);
             case "DeleteUserPool" -> handleDeleteUserPool(request);
             case "CreateUserPoolClient" -> handleCreateUserPoolClient(request);
             case "DescribeUserPoolClient" -> handleDescribeUserPoolClient(request);
             case "ListUserPoolClients" -> handleListUserPoolClients(request);
             case "DeleteUserPoolClient" -> handleDeleteUserPoolClient(request);
+            case "UpdateUserPoolClient" -> handleUpdateUserPoolClient(request);
             case "CreateResourceServer" -> handleCreateResourceServer(request);
             case "DescribeResourceServer" -> handleDescribeResourceServer(request);
             case "ListResourceServers" -> handleListResourceServers(request);
             case "UpdateResourceServer" -> handleUpdateResourceServer(request);
             case "DeleteResourceServer" -> handleDeleteResourceServer(request);
+            case "AdminResetUserPassword" -> handleAdminResetUserPassword(request);
             case "AdminCreateUser" -> handleAdminCreateUser(request);
             case "AdminGetUser" -> handleAdminGetUser(request);
             case "AdminDeleteUser" -> handleAdminDeleteUser(request);
             case "AdminSetUserPassword" -> handleAdminSetUserPassword(request);
             case "AdminUpdateUserAttributes" -> handleAdminUpdateUserAttributes(request);
             case "AdminUserGlobalSignOut" -> handleAdminUserGlobalSignOut(request);
+            case "AdminEnableUser" -> handleAdminEnableUser(request);
+            case "AdminDisableUser" -> handleAdminDisableUser(request);
             case "ListUsers" -> handleListUsers(request);
             case "InitiateAuth" -> handleInitiateAuth(request);
             case "AdminInitiateAuth" -> handleAdminInitiateAuth(request);
             case "RespondToAuthChallenge" -> handleRespondToAuthChallenge(request);
+            case "AdminRespondToAuthChallenge" -> handleAdminRespondToAuthChallenge(request);
             case "SignUp" -> handleSignUp(request);
             case "ConfirmSignUp" -> handleConfirmSignUp(request);
             case "ChangePassword" -> handleChangePassword(request);
@@ -73,6 +82,9 @@ public class CognitoJsonHandler {
             case "AdminRemoveUserFromGroup" -> handleAdminRemoveUserFromGroup(request);
             case "AdminListGroupsForUser" -> handleAdminListGroupsForUser(request);
             case "GetTokensFromRefreshToken" -> handleGetTokensFromRefreshToken(request);
+            case "ListUserPoolClientSecrets" -> handleListUserPoolClientSecrets(request);
+            case "AddUserPoolClientSecret" -> handleAddUserPoolClientSecret(request);
+            case "DeleteUserPoolClientSecret" -> handleDeleteUserPoolClientSecret(request);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -109,6 +121,24 @@ public class CognitoJsonHandler {
         UserPool pool = service.updateUserPool(reqMap, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.set("UserPool", userPoolToFullNode(pool));
+        return Response.ok(response).build();
+    }
+
+    private Response handleTagResource(JsonNode request) {
+        @SuppressWarnings("unchecked")
+        Map<String, String> tags = objectMapper.convertValue(request.path("Tags"), Map.class);
+        service.tagResource(request.path("ResourceArn").asText(), tags);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUntagResource(JsonNode request) {
+        service.untagResource(request.path("ResourceArn").asText(), readStringList(request.path("TagKeys")));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleListTagsForResource(JsonNode request) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Tags", objectMapper.valueToTree(service.listTagsForResource(request.path("ResourceArn").asText())));
         return Response.ok(response).build();
     }
 
@@ -152,7 +182,7 @@ public class CognitoJsonHandler {
         List<UserPoolClient> clients = service.listUserPoolClients(request.path("UserPoolId").asText());
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode items = response.putArray("UserPoolClients");
-        clients.forEach(c -> items.add(clientToNode(c)));
+        clients.forEach(c -> items.add(clientToDescriptionNode(c)));
         return Response.ok(response).build();
     }
 
@@ -162,6 +192,20 @@ public class CognitoJsonHandler {
                 request.path("ClientId").asText()
         );
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUpdateUserPoolClient(JsonNode request) {
+        UserPoolClient client = service.updateUserPoolClient(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText(),
+                request.has("ClientName") ? request.path("ClientName").asText() : null,
+                request.has("AllowedOAuthFlowsUserPoolClient") ? request.path("AllowedOAuthFlowsUserPoolClient").asBoolean() : null,
+                readStringList(request.path("AllowedOAuthFlows")),
+                readStringList(request.path("AllowedOAuthScopes"))
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("UserPoolClient", clientToNode(client));
+        return Response.ok(response).build();
     }
 
     private Response handleCreateResourceServer(JsonNode request) {
@@ -251,6 +295,11 @@ public class CognitoJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleAdminResetUserPassword(JsonNode request) {
+        service.adminResetUserPassword(request.path("UserPoolId").asText(), request.path("Username").asText());
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private Response handleAdminDeleteUser(JsonNode request) {
         service.adminDeleteUser(request.path("UserPoolId").asText(), request.path("Username").asText());
         return Response.ok(objectMapper.createObjectNode()).build();
@@ -285,6 +334,16 @@ public class CognitoJsonHandler {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
+    private Response handleAdminEnableUser(JsonNode request) {
+        service.adminEnableUser(request.path("UserPoolId").asText(), request.path("Username").asText());
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleAdminDisableUser(JsonNode request) {
+        service.adminDisableUser(request.path("UserPoolId").asText(), request.path("Username").asText());
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private Response handleListUsers(JsonNode request) {
         String filter = request.path("Filter").isMissingNode() ? null : request.path("Filter").asText(null);
         List<CognitoUser> users = service.listUsers(request.path("UserPoolId").asText(), filter);
@@ -305,11 +364,14 @@ public class CognitoJsonHandler {
     private Response handleInitiateAuth(JsonNode request) {
         Map<String, String> params = new HashMap<>();
         request.path("AuthParameters").fields().forEachRemaining(e -> params.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = new HashMap<>();
+        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
 
         Map<String, Object> result = service.initiateAuth(
                 request.path("ClientId").asText(),
                 request.path("AuthFlow").asText(),
-                params
+                params,
+                clientMetadata
         );
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
@@ -317,12 +379,15 @@ public class CognitoJsonHandler {
     private Response handleAdminInitiateAuth(JsonNode request) {
         Map<String, String> params = new HashMap<>();
         request.path("AuthParameters").fields().forEachRemaining(e -> params.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = new HashMap<>();
+        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
 
         Map<String, Object> result = service.adminInitiateAuth(
                 request.path("UserPoolId").asText(),
                 request.path("ClientId").asText(),
                 request.path("AuthFlow").asText(),
-                params
+                params,
+                clientMetadata
         );
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
@@ -330,12 +395,32 @@ public class CognitoJsonHandler {
     private Response handleRespondToAuthChallenge(JsonNode request) {
         Map<String, String> responses = new HashMap<>();
         request.path("ChallengeResponses").fields().forEachRemaining(e -> responses.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = new HashMap<>();
+        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
 
         Map<String, Object> result = service.respondToAuthChallenge(
                 request.path("ClientId").asText(),
                 request.path("ChallengeName").asText(),
                 request.path("Session").asText(null),
-                responses
+                responses,
+                clientMetadata
+        );
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
+    private Response handleAdminRespondToAuthChallenge(JsonNode request) {
+        Map<String, String> responses = new HashMap<>();
+        request.path("ChallengeResponses").fields().forEachRemaining(e -> responses.put(e.getKey(), e.getValue().asText()));
+        Map<String, String> clientMetadata = new HashMap<>();
+        request.path("ClientMetadata").fields().forEachRemaining(e -> clientMetadata.put(e.getKey(), e.getValue().asText()));
+
+        Map<String, Object> result = service.adminRespondToAuthChallenge(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText(),
+                request.path("ChallengeName").asText(),
+                request.path("Session").asText(null),
+                responses,
+                clientMetadata
         );
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
@@ -352,7 +437,7 @@ public class CognitoJsonHandler {
         );
         ObjectNode response = objectMapper.createObjectNode();
         response.put("UserConfirmed", "CONFIRMED".equals(user.getUserStatus()));
-        response.put("UserSub", user.getUsername());
+        response.put("UserSub", user.getAttributes().get("sub"));
         ObjectNode delivery = response.putObject("CodeDeliveryDetails");
         delivery.put("AttributeName", "email");
         delivery.put("DeliveryMedium", "EMAIL");
@@ -437,7 +522,7 @@ public class CognitoJsonHandler {
         node.set("Policies", objectMapper.valueToTree(p.getPolicies() != null ? p.getPolicies() : new HashMap<>()));
         node.put("DeletionProtection", p.getDeletionProtection() != null ? p.getDeletionProtection() : "INACTIVE");
         node.set("LambdaConfig", objectMapper.valueToTree(p.getLambdaConfig() != null ? p.getLambdaConfig() : new HashMap<>()));
-        node.set("SchemaAttributes", objectMapper.valueToTree(p.getSchemaAttributes() != null ? p.getSchemaAttributes() : new java.util.ArrayList<>()));
+        node.set("SchemaAttributes", objectMapper.valueToTree(CognitoStandardAttributes.merge(p.getSchemaAttributes())));
         node.set("AutoVerifiedAttributes", objectMapper.valueToTree(p.getAutoVerifiedAttributes() != null ? p.getAutoVerifiedAttributes() : new java.util.ArrayList<>()));
         node.set("AliasAttributes", objectMapper.valueToTree(p.getAliasAttributes() != null ? p.getAliasAttributes() : new java.util.ArrayList<>()));
         node.set("UsernameAttributes", objectMapper.valueToTree(p.getUsernameAttributes() != null ? p.getUsernameAttributes() : new java.util.ArrayList<>()));
@@ -462,6 +547,14 @@ public class CognitoJsonHandler {
         node.set("AccountRecoverySetting", objectMapper.valueToTree(p.getAccountRecoverySetting() != null ? p.getAccountRecoverySetting() : new HashMap<>()));
         node.put("UserPoolTier", p.getUserPoolTier() != null ? p.getUserPoolTier() : "ESSENTIALS");
 
+        return node;
+    }
+
+    private ObjectNode clientToDescriptionNode(UserPoolClient c) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ClientId", c.getClientId());
+        node.put("ClientName", c.getClientName());
+        node.put("UserPoolId", c.getUserPoolId());
         return node;
     }
 
@@ -615,6 +708,54 @@ public class CognitoJsonHandler {
         if (g.getRoleArn() != null) node.put("RoleArn", g.getRoleArn());
         node.put("CreationDate", g.getCreationDate());
         node.put("LastModifiedDate", g.getLastModifiedDate());
+        return node;
+    }
+
+    private Response handleListUserPoolClientSecrets(JsonNode request) {
+        List<UserPoolClientSecret> clientSecrets =
+                service.listUserPoolClientSecrets(
+                        request.path("UserPoolId").asText(),
+                        request.path("ClientId").asText()
+                );
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("ClientSecrets");
+        clientSecrets.forEach(cs -> items.add(clientSecretToNode(cs, false)));
+        return Response.ok(response).build();
+    }
+
+    private Response handleAddUserPoolClientSecret(JsonNode request) {
+        String clientId = request.path("ClientId").asText();
+        String clientSecret = request.path("ClientSecret").asText(null);
+        String userPoolId = request.path("UserPoolId").asText();
+
+        UserPoolClientSecret cs = service.addUserPoolClientSecret(
+                clientId, clientSecret, userPoolId
+        );
+
+        boolean includeClientSecretValue = clientSecret == null;
+        ObjectNode wrapper = objectMapper.createObjectNode();
+        wrapper.set("ClientSecretDescriptor", clientSecretToNode(cs, includeClientSecretValue));
+        return Response.ok(wrapper).build();
+    }
+
+    private Response handleDeleteUserPoolClientSecret(JsonNode request) {
+        String clientId = request.path("ClientId").asText();
+        String clientSecretId = request.path("ClientSecretId").asText();
+        String userPoolId = request.path("UserPoolId").asText();
+
+        service.deleteUserPoolClientSecret(clientId, clientSecretId, userPoolId);
+
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private ObjectNode clientSecretToNode(UserPoolClientSecret cs,
+                                          boolean includeClientSecretValue) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ClientSecretId", cs.getClientSecretId());
+        if (includeClientSecretValue) {
+            node.put("ClientSecretValue", cs.getClientSecretValue());
+        }
+        node.put("ClientSecretCreateDate", cs.getClientSecretCreateDate());
         return node;
     }
 

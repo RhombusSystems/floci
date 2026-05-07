@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
@@ -9,6 +10,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
@@ -48,6 +50,7 @@ public class AslExecutor {
     private final LambdaFunctionStore functionStore;
     private final DynamoDbService dynamoDbService;
     private final DynamoDbJsonHandler dynamoDbJsonHandler;
+    private final SqsJsonHandler sqsJsonHandler;
     private final ObjectMapper objectMapper;
     private final JsonataEvaluator jsonataEvaluator;
     private final Instance<StepFunctionsService> sfnService;
@@ -60,12 +63,14 @@ public class AslExecutor {
     @Inject
     public AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
                        DynamoDbService dynamoDbService, DynamoDbJsonHandler dynamoDbJsonHandler,
+                       SqsJsonHandler sqsJsonHandler,
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService) {
         this.lambdaExecutor = lambdaExecutor;
         this.functionStore = functionStore;
         this.dynamoDbService = dynamoDbService;
         this.dynamoDbJsonHandler = dynamoDbJsonHandler;
+        this.sqsJsonHandler = sqsJsonHandler;
         this.objectMapper = objectMapper;
         this.jsonataEvaluator = jsonataEvaluator;
         this.sfnService = sfnService;
@@ -341,6 +346,18 @@ public class AslExecutor {
             return invokeAwsSdkDynamoDb(camelCaseAction, input, region);
         }
 
+        // SQS optimized integration
+        if (resource.equals("arn:aws:states:::sqs:sendMessage")) {
+            String region = extractRegionFromArn(sm.getStateMachineArn());
+            return invokeOptimizedSqsSendMessage(input, region);
+        }
+
+        // AWS SDK service integration: SQS SendMessage
+        if (resource.equals("arn:aws:states:::aws-sdk:sqs:sendMessage")) {
+            String region = extractRegionFromArn(sm.getStateMachineArn());
+            return invokeAwsSdkSqsSendMessage(input, region);
+        }
+
         // Nested state machine integration
         if (resource.startsWith("arn:aws:states:::states:startExecution")) {
             String mode = resource.substring("arn:aws:states:::states:startExecution".length());
@@ -448,7 +465,7 @@ public class AslExecutor {
                         ? input.get("ExpressionAttributeNames") : null;
                 JsonNode exprAttrValues = input.has("ExpressionAttributeValues")
                         ? input.get("ExpressionAttributeValues") : null;
-                dynamoDbService.putItem(tableName, item, conditionExpr, exprAttrNames, exprAttrValues, region);
+                dynamoDbService.putItem(tableName, item, conditionExpr, exprAttrNames, exprAttrValues, region, "NONE");
                 return objectMapper.createObjectNode();
             }
             case "getItem" -> {
@@ -468,7 +485,7 @@ public class AslExecutor {
                         ? input.get("ExpressionAttributeNames") : null;
                 JsonNode exprAttrValues = input.has("ExpressionAttributeValues")
                         ? input.get("ExpressionAttributeValues") : null;
-                dynamoDbService.deleteItem(tableName, key, conditionExpr, exprAttrNames, exprAttrValues, region);
+                dynamoDbService.deleteItem(tableName, key, conditionExpr, exprAttrNames, exprAttrValues, region, "NONE");
                 return objectMapper.createObjectNode();
             }
             case "scan" -> {
@@ -507,7 +524,7 @@ public class AslExecutor {
                 DynamoDbService.UpdateResult result = dynamoDbService.updateItem(
                         tableName, key, attributeUpdates, updateExpression,
                         exprAttrNames, exprAttrValues, returnValues,
-                        conditionExpression, region);
+                        conditionExpression, region, "NONE");
 
                 ObjectNode response = objectMapper.createObjectNode();
                 if ("ALL_NEW".equals(returnValues) && result.newItem() != null) {
@@ -556,6 +573,82 @@ public class AslExecutor {
             return jsonNode;
         }
         return objectMapper.createObjectNode();
+    }
+
+    private JsonNode invokeOptimizedSqsSendMessage(JsonNode input, String region) {
+        ObjectNode request = normalizeSqsSendMessageInput(input);
+        return invokeSqsAction("SendMessage", request, region, "SQS.");
+    }
+
+    private JsonNode invokeAwsSdkSqsSendMessage(JsonNode input, String region) {
+        return invokeSqsAction("SendMessage", normalizeSqsSendMessageInput(input), region, "Sqs.", true);
+    }
+
+    private ObjectNode normalizeSqsSendMessageInput(JsonNode input) {
+        ObjectNode request = input != null && input.isObject()
+                ? ((ObjectNode) input.deepCopy())
+                : objectMapper.createObjectNode();
+
+        JsonNode messageBody = request.get("MessageBody");
+        if (messageBody != null && !messageBody.isTextual() && !messageBody.isNull()) {
+            request.put("MessageBody", messageBody.toString());
+        }
+        return request;
+    }
+
+    private JsonNode invokeSqsAction(String action, JsonNode input, String region, String errorPrefix) {
+        return invokeSqsAction(action, input, region, errorPrefix, false);
+    }
+
+    private JsonNode invokeSqsAction(String action, JsonNode input, String region, String errorPrefix, boolean awsSdkStyleErrors) {
+        jakarta.ws.rs.core.Response response;
+        try {
+            response = sqsJsonHandler.handle(action, input, region);
+        } catch (AwsException e) {
+            throw new FailStateException(errorPrefix + normalizeSqsErrorCode(e.getErrorCode(), awsSdkStyleErrors), e.getMessage());
+        } catch (Exception e) {
+            throw new FailStateException(errorPrefix + "InternalServerError",
+                    e.getMessage() != null ? e.getMessage() : "SQS error");
+        }
+
+        Object entity = response.getEntity();
+        int status = response.getStatus();
+
+        if (status >= 400) {
+            if (entity instanceof AwsErrorResponse err) {
+                throw new FailStateException(errorPrefix + normalizeSqsErrorCode(err.type(), awsSdkStyleErrors), err.message());
+            }
+            if (entity instanceof JsonNode errorNode) {
+                String errorName = normalizeSqsErrorCode(errorNode.path("__type").asText("UnknownError"), awsSdkStyleErrors);
+                String errorMessage = errorNode.path("message").asText(
+                        errorNode.path("Message").asText("SQS operation failed"));
+                throw new FailStateException(errorPrefix + errorName, errorMessage);
+            }
+            throw new FailStateException(errorPrefix + "ServiceException", "SQS operation failed");
+        }
+
+        if (entity instanceof JsonNode jsonNode) {
+            return jsonNode;
+        }
+        return objectMapper.createObjectNode();
+    }
+
+    private String normalizeSqsErrorCode(String errorCode, boolean awsSdkStyleErrors) {
+        if (!awsSdkStyleErrors || errorCode == null || errorCode.isBlank()) {
+            return errorCode;
+        }
+        return switch (errorCode) {
+            case "AWS.SimpleQueueService.NonExistentQueue" -> "QueueDoesNotExistException";
+            case "UnsupportedOperation" -> "UnsupportedOperationException";
+            case "ReceiptHandleIsInvalid" -> "ReceiptHandleIsInvalidException";
+            case "QueueAlreadyExists" -> "QueueNameExistsException";
+            case "InvalidAddress" -> "InvalidAddressException";
+            case "InvalidSecurity" -> "InvalidSecurityException";
+            case "InvalidMessageContents" -> "InvalidMessageContentsException";
+            case "OverLimit" -> "OverLimitException";
+            case "RequestThrottled" -> "RequestThrottledException";
+            default -> errorCode;
+        };
     }
 
     private StateResult executeChoiceState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context) throws Exception {
@@ -777,9 +870,31 @@ public class AslExecutor {
         String startAt = iterator.path("StartAt").asText();
         JsonNode iteratorStates = iterator.path("States");
 
+        // Determine which transformation field is present (ItemSelector is current; Parameters is legacy)
+        JsonNode itemTransform = stateDef.has("ItemSelector") ? stateDef.get("ItemSelector")
+                : stateDef.has("Parameters") ? stateDef.get("Parameters") : null;
+
+        // Resolve InputPath before iterating so $. in ItemSelector sees the Map state's effective input
+        JsonNode mapInput = applyInputPath(stateDef, input);
+
         ArrayNode results = objectMapper.createArrayNode();
+        int index = 0;
         for (JsonNode item : items) {
-            results.add(executeBranch(startAt, iteratorStates, item, sm, topLevelQueryLanguage, context));
+            JsonNode iterInput = item;
+            if (itemTransform != null) {
+                // Enrich context with Map.Item.Index and Map.Item.Value for $$.Map.* references.
+                // $ in ItemSelector resolves against the Map state's effective input, not the item.
+                ObjectNode iterContext = ((ObjectNode) context).deepCopy();
+                ObjectNode mapCtx = objectMapper.createObjectNode();
+                ObjectNode mapItem = objectMapper.createObjectNode();
+                mapItem.put("Index", index);
+                mapItem.set("Value", item);
+                mapCtx.set("Item", mapItem);
+                iterContext.set("Map", mapCtx);
+                iterInput = resolveParameters(itemTransform, mapInput, iterContext);
+            }
+            results.add(executeBranch(startAt, iteratorStates, iterInput, sm, topLevelQueryLanguage, context));
+            index++;
         }
 
         if (jsonata) {
@@ -1199,8 +1314,7 @@ public class AslExecutor {
     }
 
     private String extractRegionFromArn(String arn) {
-        String[] parts = arn.split(":");
-        return parts.length > 3 ? parts[3] : "us-east-1";
+        return AwsArnUtils.regionOrDefault(arn, "us-east-1");
     }
 
     record StateResult(JsonNode output, String nextState) {}

@@ -5,11 +5,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.RandomUtils;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -18,10 +24,15 @@ import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.Base64;
+import java.util.List;
+import java.util.Spliterators;
 import java.util.UUID;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -167,6 +178,36 @@ class CognitoIntegrationTest {
                 document.path("jwks_uri").asText());
         assertEquals("public", document.path("subject_types_supported").get(0).asText());
         assertEquals("RS256", document.path("id_token_signing_alg_values_supported").get(0).asText());
+    }
+
+    @Test
+    @Order(5)
+    void describeUserPoolReturnsAllTwentyStandardAttributes() throws Exception {
+        JsonNode body = cognitoJson("DescribeUserPool", """
+                { "UserPoolId": "%s" }
+                """.formatted(poolId));
+
+        JsonNode schema = body.path("UserPool").path("SchemaAttributes");
+        assertEquals(20, schema.size(), "DescribeUserPool must include all 20 Cognito standard attributes");
+
+        java.util.Set<String> names = new java.util.HashSet<>();
+        schema.forEach(attr -> names.add(attr.path("Name").asText()));
+
+        for (String expected : List.of("sub", "name", "given_name", "family_name", "middle_name",
+                "nickname", "preferred_username", "profile", "picture", "website",
+                "email", "email_verified", "gender", "birthdate", "zoneinfo",
+                "locale", "phone_number", "phone_number_verified", "address", "updated_at")) {
+            assertTrue(names.contains(expected), "Missing standard attribute in DescribeUserPool response: " + expected);
+        }
+
+        // spot-check: sub must be required and immutable
+        JsonNode sub = StreamSupport.stream(
+                        Spliterators.spliteratorUnknownSize(schema.elements(), 0), false)
+                .filter(n -> "sub".equals(n.path("Name").asText()))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(sub.path("Required").asBoolean(), "sub must be Required");
+        assertFalse(sub.path("Mutable").asBoolean(), "sub must not be Mutable");
     }
 
     // ── Groups ────────────────────────────────────────────────────────
@@ -358,6 +399,169 @@ class CognitoIntegrationTest {
                 "IdToken should not contain client_id");
     }
 
+    // ── Issue #452: IdToken contains aud claim ─────────────────────────
+
+    @Test
+    @Order(32)
+    void idTokenContainsAudClaimMatchingClientId() throws Exception {
+        JsonNode auth = cognitoJson("InitiateAuth", """
+                {
+                  "ClientId": "%s",
+                  "AuthFlow": "USER_PASSWORD_AUTH",
+                  "AuthParameters": { "USERNAME": "%s", "PASSWORD": "%s" }
+                }
+                """.formatted(clientId, username, password));
+        String idToken = auth.path("AuthenticationResult").path("IdToken").asText();
+        JsonNode payload = decodeJwtPayload(idToken);
+        assertEquals(clientId, payload.path("aud").asText(),
+                "IdToken must contain aud claim set to the requesting client ID");
+    }
+
+    @Test
+    @Order(33)
+    void accessTokenDoesNotContainAudClaim() throws Exception {
+        String accessToken = initiateAuthAndGetAccessToken();
+        JsonNode payload = decodeJwtPayload(accessToken);
+        assertTrue(payload.path("aud").isMissingNode(),
+                "AccessToken should not contain aud claim");
+    }
+
+    @Test
+    @Order(34)
+    void idTokenFromRefreshTokenContainsAudClaim() throws Exception {
+        JsonNode authResp = cognitoJson("InitiateAuth", """
+                {
+                  "ClientId": "%s",
+                  "AuthFlow": "USER_PASSWORD_AUTH",
+                  "AuthParameters": { "USERNAME": "%s", "PASSWORD": "%s" }
+                }
+                """.formatted(clientId, username, password));
+        String refreshToken = authResp.path("AuthenticationResult").path("RefreshToken").asText();
+
+        JsonNode refreshed = cognitoJson("InitiateAuth", """
+                {
+                  "ClientId": "%s",
+                  "AuthFlow": "REFRESH_TOKEN_AUTH",
+                  "AuthParameters": { "REFRESH_TOKEN": "%s" }
+                }
+                """.formatted(clientId, refreshToken));
+        String idToken = refreshed.path("AuthenticationResult").path("IdToken").asText();
+        JsonNode payload = decodeJwtPayload(idToken);
+        assertEquals(clientId, payload.path("aud").asText(),
+                "IdToken from refresh flow must contain aud claim set to the requesting client ID");
+    }
+
+    // ── Issue #416: ListUserPoolClients response matches spec ──────────
+
+    @Test
+    @Order(35)
+    void listUserPoolClientsReturnsOnlyDescriptionFields() throws Exception {
+        // Create a client with a secret to ensure extra fields exist
+        JsonNode secretClient = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "secret-client",
+                  "GenerateSecret": true,
+                  "AllowedOAuthFlows": ["code"],
+                  "AllowedOAuthScopes": ["openid"]
+                }
+                """.formatted(poolId));
+        String secretClientId = secretClient.path("UserPoolClient").path("ClientId").asText();
+        assertNotNull(secretClient.path("UserPoolClient").path("ClientSecret").asText(null),
+                "Created client should have a ClientSecret");
+
+        // List clients and verify only description fields are returned
+        JsonNode listResp = cognitoJson("ListUserPoolClients", """
+                { "UserPoolId": "%s" }
+                """.formatted(poolId));
+
+        assertTrue(listResp.path("UserPoolClients").size() >= 2,
+                "Should list at least 2 clients");
+
+        for (JsonNode client : listResp.path("UserPoolClients")) {
+            // Required fields
+            assertTrue(client.has("ClientId"), "Must have ClientId");
+            assertTrue(client.has("ClientName"), "Must have ClientName");
+            assertTrue(client.has("UserPoolId"), "Must have UserPoolId");
+
+            // Fields that must NOT appear per AWS spec (UserPoolClientDescription)
+            assertTrue(client.path("ClientSecret").isMissingNode(),
+                    "ListUserPoolClients must not include ClientSecret");
+            assertTrue(client.path("GenerateSecret").isMissingNode(),
+                    "ListUserPoolClients must not include GenerateSecret");
+            assertTrue(client.path("AllowedOAuthFlows").isMissingNode(),
+                    "ListUserPoolClients must not include AllowedOAuthFlows");
+            assertTrue(client.path("AllowedOAuthScopes").isMissingNode(),
+                    "ListUserPoolClients must not include AllowedOAuthScopes");
+            assertTrue(client.path("AllowedOAuthFlowsUserPoolClient").isMissingNode(),
+                    "ListUserPoolClients must not include AllowedOAuthFlowsUserPoolClient");
+            assertTrue(client.path("CreationDate").isMissingNode(),
+                    "ListUserPoolClients must not include CreationDate");
+            assertTrue(client.path("LastModifiedDate").isMissingNode(),
+                    "ListUserPoolClients must not include LastModifiedDate");
+        }
+
+        // Verify DescribeUserPoolClient still returns full details
+        JsonNode describeResp = cognitoJson("DescribeUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientId": "%s"
+                }
+                """.formatted(poolId, secretClientId));
+        JsonNode fullClient = describeResp.path("UserPoolClient");
+        assertNotNull(fullClient.path("ClientSecret").asText(null),
+                "DescribeUserPoolClient must include ClientSecret");
+        assertTrue(fullClient.has("GenerateSecret"),
+                "DescribeUserPoolClient must include GenerateSecret");
+    }
+
+    @Test
+    @Order(36)
+    void updateUserPoolClient() throws Exception {
+        // 1. Create a client
+        JsonNode createResp = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "initial-name"
+                }
+                """.formatted(poolId));
+        String cid = createResp.path("UserPoolClient").path("ClientId").asText();
+
+        // 2. Update the client
+        cognitoJson("UpdateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientId": "%s",
+                  "ClientName": "updated-name",
+                  "AllowedOAuthFlowsUserPoolClient": true,
+                  "AllowedOAuthFlows": ["code", "implicit"],
+                  "AllowedOAuthScopes": ["email", "openid"]
+                }
+                """.formatted(poolId, cid));
+
+        // 3. Verify the updates
+        JsonNode describeResp = cognitoJson("DescribeUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientId": "%s"
+                }
+                """.formatted(poolId, cid));
+        JsonNode client = describeResp.path("UserPoolClient");
+
+        assertEquals("updated-name", client.path("ClientName").asText());
+        assertEquals(true, client.path("AllowedOAuthFlowsUserPoolClient").asBoolean());
+        
+        JsonNode flows = client.path("AllowedOAuthFlows");
+        assertEquals(2, flows.size());
+        assertTrue(flows.toString().contains("code"));
+        assertTrue(flows.toString().contains("implicit"));
+
+        JsonNode scopes = client.path("AllowedOAuthScopes");
+        assertEquals(2, scopes.size());
+        assertTrue(scopes.toString().contains("email"));
+        assertTrue(scopes.toString().contains("openid"));
+    }
+
     // ── Issue #229: Password verification ──────────────────────────────
 
     @Test
@@ -498,7 +702,298 @@ class CognitoIntegrationTest {
         assertNotNull(refreshed.path("AuthenticationResult").path("IdToken").asText(null));
     }
 
+    // ── Client Secrets ────────────────────────────────────────────────
+
+    private static String clientSecretId1;
+    private static String clientSecretId2;
+
+    @Test
+    @Order(80)
+    void listUserPoolClientSecretsInitiallyEmpty() throws Exception {
+        JsonNode resp = cognitoJson("ListUserPoolClientSecrets", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId));
+        assertEquals(0, resp.path("ClientSecrets").size());
+    }
+
+    @ParameterizedTest
+    @Order(81)
+    @MethodSource("generateInvalidUserPoolSecret")
+    void addUserPoolClientSecretInvalid(String clientSecret) {
+        cognitoAction("AddUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s",
+                  "ClientSecret": "%s"
+                }
+                """.formatted(clientId, poolId, clientSecret))
+                .then()
+                .statusCode(400);
+    }
+
+    public static Stream<Arguments> generateInvalidUserPoolSecret() {
+        return Stream.of(
+            Arguments.of("a".repeat(23)), // too short
+            Arguments.of("a".repeat(65)), // too large
+            Arguments.of("$".repeat(32)) // contains invalid characters
+        );
+    }
+
+    @Test
+    @Order(82)
+    void addUserPoolClientSecretAutoGeneratesValue() throws Exception {
+        JsonNode resp = cognitoJson("AddUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId));
+        JsonNode clientSecretDescriptor = resp.path("ClientSecretDescriptor");
+        clientSecretId1 = clientSecretDescriptor.path("ClientSecretId").asText();
+        assertNotNull(clientSecretId1);
+        assertTrue(clientSecretId1.startsWith(clientId + "--"),
+                "ClientSecretId should be prefixed with the ClientId");
+        assertNotNull(clientSecretDescriptor.path("ClientSecretValue").asText(null),
+                "Auto-generated secret should include ClientSecretValue in response");
+        assertTrue(clientSecretDescriptor.path("ClientSecretCreateDate").asLong() > 0);
+    }
+
+    @Test
+    @Order(83)
+    void addUserPoolClientSecretWithExplicitValue() throws Exception {
+        String clientSecretValue = UUID.randomUUID().toString().replaceAll("-", "");
+        JsonNode resp = cognitoJson("AddUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s",
+                  "ClientSecret": "%s"
+                }
+                """.formatted(clientId, poolId, clientSecretValue));
+        clientSecretId2 = resp.path("ClientSecretDescriptor").path("ClientSecretId").asText();
+        assertNotNull(clientSecretId2);
+        assertTrue(resp.path("ClientSecretDescriptor").path("ClientSecretValue").isMissingNode(),
+                "Explicit secret should not include ClientSecretValue in response");
+    }
+
+    @Test
+    @Order(84)
+    void listUserPoolClientSecretsReturnsTwo() throws Exception {
+        JsonNode resp = cognitoJson("ListUserPoolClientSecrets", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId));
+        assertEquals(2, resp.path("ClientSecrets").size());
+    }
+
+    @Test
+    @Order(85)
+    void addUserPoolClientSecretExceedsLimit() {
+        cognitoAction("AddUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId))
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(86)
+    void deleteUserPoolClientSecretNotFound() {
+        cognitoAction("DeleteUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "ClientSecretId": "nonexistent",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId))
+                .then()
+                .statusCode(404);
+    }
+
+    @Test
+    @Order(87)
+    void deleteUserPoolClientSecretCannotDeleteOnlyOne() {
+        cognitoAction("DeleteUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "ClientSecretId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, clientSecretId1, poolId))
+                .then()
+                .statusCode(200);
+
+        cognitoAction("DeleteUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "ClientSecretId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, clientSecretId2, poolId))
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(88)
+    void listUserPoolClientSecretsAfterDelete() throws Exception {
+        JsonNode resp = cognitoJson("ListUserPoolClientSecrets", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(clientId, poolId));
+        assertEquals(1, resp.path("ClientSecrets").size());
+        assertEquals(clientSecretId2, resp.path("ClientSecrets").get(0).path("ClientSecretId").asText());
+    }
+
+    @Test
+    @Order(89)
+    void fullRotateScenario() throws Exception {
+        // Set up a resource server so the OAuth client_credentials flow has valid scopes
+        cognitoJson("CreateResourceServer", """
+                {
+                  "UserPoolId": "%s",
+                  "Identifier": "api",
+                  "Name": "API",
+                  "Scopes": [
+                    { "ScopeName": "read", "ScopeDescription": "Read access" }
+                  ]
+                }
+                """.formatted(poolId));
+
+        // Create a confidential client with client_credentials flow enabled
+        JsonNode clientResp = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "rotation-client",
+                  "GenerateSecret": true,
+                  "AllowedOAuthFlowsUserPoolClient": true,
+                  "AllowedOAuthFlows": ["client_credentials"],
+                  "AllowedOAuthScopes": ["api/read"]
+                }
+                """.formatted(poolId));
+        String rotClientId = clientResp.path("UserPoolClient").path("ClientId").asText();
+        String secret1Value = clientResp.path("UserPoolClient").path("ClientSecret").asText();
+
+        // client-secret-1 is still valid — authenticate with client-credentials successfully
+        oauthToken(rotClientId, secret1Value).then().statusCode(200);
+
+        // grab secret-1's ID so we can delete it later
+        JsonNode secrets = cognitoJson("ListUserPoolClientSecrets", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(rotClientId, poolId));
+        assertEquals(1, secrets.path("ClientSecrets").size());
+        String secret1Id = secrets.path("ClientSecrets").get(0).path("ClientSecretId").asText();
+
+        // add new client-secret (auto-generated)
+        JsonNode addResp = cognitoJson("AddUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(rotClientId, poolId));
+        String secret2Value = addResp.path("ClientSecretDescriptor")
+                .path("ClientSecretValue").asText();
+        assertNotNull(secret2Value);
+
+        // authenticate with new client-credentials successfully
+        oauthToken(rotClientId, secret2Value).then().statusCode(200);
+
+        // delete client-credentials 1
+        cognitoAction("DeleteUserPoolClientSecret", """
+                {
+                  "ClientId": "%s",
+                  "ClientSecretId": "%s",
+                  "UserPoolId": "%s"
+                }
+                """.formatted(rotClientId, secret1Id, poolId))
+                .then()
+                .statusCode(200);
+
+        // authentication with client credentials 1 fails
+        oauthToken(rotClientId, secret1Value).then().statusCode(400);
+
+        // secret 2 still works after rotation
+        oauthToken(rotClientId, secret2Value).then().statusCode(200);
+    }
+
+    @Test
+    @Order(90)
+    void adminResetUserPasswordBlocksAuth() throws Exception {
+        // 1. Reset the user's password
+        cognitoAction("AdminResetUserPassword", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "%s"
+                }
+                """.formatted(poolId, username))
+                .then()
+                .statusCode(200);
+
+        // 2. Authentication should now fail with PasswordResetRequiredException
+        cognitoAction("InitiateAuth", """
+                {
+                  "ClientId": "%s",
+                  "AuthFlow": "USER_PASSWORD_AUTH",
+                  "AuthParameters": {
+                    "USERNAME": "%s",
+                    "PASSWORD": "%s"
+                  }
+                }
+                """.formatted(clientId, username, password))
+                .then()
+                .statusCode(400)
+                .body("__type", org.hamcrest.Matchers.containsString("PasswordResetRequiredException"));
+
+        // 3. Admin sets a new password
+        String newPassword = "NewPassword123!";
+        cognitoAction("AdminSetUserPassword", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "%s",
+                  "Password": "%s",
+                  "Permanent": true
+                }
+                """.formatted(poolId, username, newPassword))
+                .then()
+                .statusCode(200);
+
+        // 4. Authentication works again with new password
+        cognitoAction("InitiateAuth", """
+                {
+                  "ClientId": "%s",
+                  "AuthFlow": "USER_PASSWORD_AUTH",
+                  "AuthParameters": {
+                    "USERNAME": "%s",
+                    "PASSWORD": "%s"
+                  }
+                }
+                """.formatted(clientId, username, newPassword))
+                .then()
+                .statusCode(200);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────
+
+    private static Response oauthToken(String oauthClientId, String oauthClientSecret) {
+        return given()
+                .formParam("grant_type", "client_credentials")
+                .formParam("client_id", oauthClientId)
+                .formParam("client_secret", oauthClientSecret)
+        .when()
+                .post("/cognito-idp/oauth2/token");
+    }
 
     private static Response cognitoAction(String action, String body) {
         return given()

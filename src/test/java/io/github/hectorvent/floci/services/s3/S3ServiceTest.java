@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.s3.model.GetObjectAttributesResult;
 import io.github.hectorvent.floci.services.s3.model.LambdaNotification;
 import io.github.hectorvent.floci.services.s3.model.NotificationConfiguration;
 import io.github.hectorvent.floci.services.s3.model.ObjectAttributeName;
+import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.BeforeEach;
@@ -112,6 +113,41 @@ class S3ServiceTest {
     }
 
     @Test
+    void putObjectTrimsBlankServerSideEncryptionToAbsent() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+
+        S3Object put = s3Service.putObject(
+                "test-bucket",
+                "blank-sse.txt",
+                "data".getBytes(StandardCharsets.UTF_8),
+                "text/plain",
+                null,
+                new PutObjectOptions().withServerSideEncryption("   ")
+        );
+
+        assertNull(put.getServerSideEncryption());
+    }
+
+    @Test
+    void putObjectRejectsUnsupportedServerSideEncryption() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                s3Service.putObject(
+                        "test-bucket",
+                        "invalid-sse.txt",
+                        "data".getBytes(StandardCharsets.UTF_8),
+                        "text/plain",
+                        null,
+                        new PutObjectOptions().withServerSideEncryption("totally-unsupported")
+                )
+        );
+
+        assertEquals("InvalidArgument", exception.getErrorCode());
+        assertTrue(exception.getMessage().contains("Unsupported x-amz-server-side-encryption value"));
+    }
+
+    @Test
     void putObjectWritesFileToDisk() {
         s3Service.createBucket("test-bucket", "us-east-1");
         byte[] data = "file content".getBytes(StandardCharsets.UTF_8);
@@ -120,6 +156,44 @@ class S3ServiceTest {
         Path filePath = tempDir.resolve("s3/test-bucket/docs/readme.txt.s3data");
         assertTrue(Files.exists(filePath));
         assertArrayEquals(data, assertDoesNotThrow(() -> Files.readAllBytes(filePath)));
+    }
+
+    @Test
+    void putObjectDoesNotRetainBytesInObjectStore() {
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        InMemoryStorage<String, S3Object> objectStore = new InMemoryStorage<>();
+        Path dataRoot = tempDir.resolve("leak-test-s3");
+        S3Service service = new S3Service(bucketStore, objectStore, dataRoot, false);
+
+        service.createBucket("leak-bucket", "us-east-1");
+        byte[] payload = new byte[64 * 1024];
+        service.putObject("leak-bucket", "big.bin", payload, "application/octet-stream", null);
+
+        S3Object cached = objectStore.get("leak-bucket/big.bin").orElseThrow();
+        assertNull(cached.getData(),
+                "S3Object cached in objectStore must not retain byte[] payload after disk persistence");
+    }
+
+    @Test
+    void putObjectVersionedDoesNotRetainBytesInObjectStore() {
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        InMemoryStorage<String, S3Object> objectStore = new InMemoryStorage<>();
+        Path dataRoot = tempDir.resolve("leak-test-versioned-s3");
+        S3Service service = new S3Service(bucketStore, objectStore, dataRoot, false);
+
+        service.createBucket("versioned-leak-bucket", "us-east-1");
+        service.putBucketVersioning("versioned-leak-bucket", "Enabled");
+        byte[] payload = new byte[64 * 1024];
+        S3Object put = service.putObject("versioned-leak-bucket", "big.bin", payload,
+                "application/octet-stream", null);
+
+        S3Object latest = objectStore.get("versioned-leak-bucket/big.bin").orElseThrow();
+        S3Object versioned = objectStore.get("versioned-leak-bucket/big.bin#v#" + put.getVersionId())
+                .orElseThrow();
+        assertNull(latest.getData(),
+                "Latest S3Object cached in objectStore must not retain byte[] after disk persistence");
+        assertNull(versioned.getData(),
+                "Versioned S3Object cached in objectStore must not retain byte[] after disk persistence");
     }
 
     @Test
@@ -477,5 +551,33 @@ class S3ServiceTest {
         assertEquals(1, page2.objects().size());
         assertFalse(page2.isTruncated());
         assertEquals("c.txt", page2.objects().get(0).getKey());
+    }
+
+    @Test
+    void resolvePathWithTraversalThrows() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        
+        // Blocked: going above the bucket root
+        AwsException ex = assertThrows(AwsException.class, () -> 
+                s3Service.putObject("test-bucket", "../outside.txt", "data".getBytes(), null, null));
+        assertEquals("InvalidKey", ex.getErrorCode());
+        
+        // Blocked: deeper traversal
+        assertThrows(AwsException.class, () -> 
+                s3Service.getObject("test-bucket", "dir/../../../etc/passwd"));
+    }
+
+    @Test
+    void putObjectWithInternalTraversalStaysWithinBucket() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        byte[] data = "safe-content".getBytes();
+
+        // Allowed: traversal that normalizes to a path still inside the bucket
+        assertDoesNotThrow(() ->
+                s3Service.putObject("test-bucket", "docs/../file.txt", data, null, null));
+
+        // Retrieve using the same literal key (S3 keys are opaque strings)
+        S3Object got = s3Service.getObject("test-bucket", "docs/../file.txt");
+        assertArrayEquals(data, got.getData());
     }
 }

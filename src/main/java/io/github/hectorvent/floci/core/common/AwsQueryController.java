@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingQueryHandler;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
 import io.github.hectorvent.floci.services.ec2.Ec2QueryHandler;
+import io.github.hectorvent.floci.services.elbv2.ElbV2QueryHandler;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsQueryHandler;
 import io.github.hectorvent.floci.services.cognito.CognitoJsonHandler;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheQueryHandler;
@@ -102,10 +104,42 @@ public class AwsQueryController {
             "GetAccountSummary", "GetAccountAuthorizationDetails"
     );
 
+    private static final Set<String> AUTOSCALING_ACTIONS = Set.of(
+            "CreateLaunchConfiguration", "DescribeLaunchConfigurations", "DeleteLaunchConfiguration",
+            "CreateAutoScalingGroup", "UpdateAutoScalingGroup", "DeleteAutoScalingGroup",
+            "DescribeAutoScalingGroups", "SetDesiredCapacity",
+            "DescribeAutoScalingInstances", "AttachInstances", "DetachInstances",
+            "TerminateInstanceInAutoScalingGroup",
+            "AttachLoadBalancerTargetGroups", "DetachLoadBalancerTargetGroups",
+            "DescribeLoadBalancerTargetGroups", "AttachLoadBalancers", "DetachLoadBalancers",
+            "PutLifecycleHook", "DeleteLifecycleHook", "DescribeLifecycleHooks",
+            "CompleteLifecycleAction", "RecordLifecycleActionHeartbeat",
+            "PutScalingPolicy", "DeletePolicy", "DescribePolicies",
+            "DescribeScalingActivities",
+            "DescribeAutoScalingNotificationTypes", "DescribeTerminationPolicyTypes",
+            "DescribeAdjustmentTypes", "DescribeAccountLimits",
+            "DescribeLifecycleHookTypes", "DescribeMetricCollectionTypes"
+    );
+
+    private static final Set<String> ELB_V2_ACTIONS = Set.of(
+            "CreateLoadBalancer", "DescribeLoadBalancers", "DeleteLoadBalancer",
+            "ModifyLoadBalancerAttributes", "DescribeLoadBalancerAttributes",
+            "SetSecurityGroups", "SetSubnets", "SetIpAddressType",
+            "CreateTargetGroup", "DescribeTargetGroups", "ModifyTargetGroup", "DeleteTargetGroup",
+            "ModifyTargetGroupAttributes", "DescribeTargetGroupAttributes",
+            "RegisterTargets", "DeregisterTargets", "DescribeTargetHealth",
+            "CreateListener", "DescribeListeners", "ModifyListener", "DeleteListener",
+            "AddListenerCertificates", "RemoveListenerCertificates", "DescribeListenerCertificates",
+            "CreateRule", "DescribeRules", "ModifyRule", "DeleteRule", "SetRulePriorities",
+            "AddTags", "RemoveTags", "DescribeTags",
+            "DescribeSSLPolicies", "DescribeAccountLimits"
+    );
+
     private static final Set<String> EC2_ACTIONS = Set.of(
             "RunInstances", "DescribeInstances", "TerminateInstances", "StartInstances", "StopInstances",
             "RebootInstances", "DescribeInstanceStatus", "DescribeInstanceAttribute", "ModifyInstanceAttribute",
             "CreateVpc", "DescribeVpcs", "DeleteVpc", "ModifyVpcAttribute", "DescribeVpcAttribute",
+            "DescribeVpcEndpointServices",
             "CreateDefaultVpc", "AssociateVpcCidrBlock", "DisassociateVpcCidrBlock",
             "CreateSubnet", "DescribeSubnets", "DeleteSubnet", "ModifySubnetAttribute",
             "CreateSecurityGroup", "DescribeSecurityGroups", "DeleteSecurityGroup",
@@ -136,6 +170,9 @@ public class AwsQueryController {
     private final CloudWatchMetricsQueryHandler cloudWatchMetricsQueryHandler;
     private final CognitoJsonHandler cognitoJsonHandler;
     private final Ec2QueryHandler ec2QueryHandler;
+    private final ElbV2QueryHandler elbV2QueryHandler;
+    private final AutoScalingQueryHandler autoScalingQueryHandler;
+    private final ResolvedServiceCatalog catalog;
     private final RegionResolver regionResolver;
 
     @Inject
@@ -148,6 +185,9 @@ public class AwsQueryController {
                               CloudWatchMetricsQueryHandler cloudWatchMetricsQueryHandler,
                               CognitoJsonHandler cognitoJsonHandler,
                               Ec2QueryHandler ec2QueryHandler,
+                              ElbV2QueryHandler elbV2QueryHandler,
+                              AutoScalingQueryHandler autoScalingQueryHandler,
+                              ResolvedServiceCatalog catalog,
                               RegionResolver regionResolver) {
         this.cloudFormationQueryHandler = cloudFormationQueryHandler;
         this.elastiCacheQueryHandler = elastiCacheQueryHandler;
@@ -160,6 +200,9 @@ public class AwsQueryController {
         this.cloudWatchMetricsQueryHandler = cloudWatchMetricsQueryHandler;
         this.cognitoJsonHandler = cognitoJsonHandler;
         this.ec2QueryHandler = ec2QueryHandler;
+        this.elbV2QueryHandler = elbV2QueryHandler;
+        this.autoScalingQueryHandler = autoScalingQueryHandler;
+        this.catalog = catalog;
         this.regionResolver = regionResolver;
     }
 
@@ -193,6 +236,8 @@ public class AwsQueryController {
             case "cloudformation" -> cloudFormationQueryHandler.handle(action, formParams, region);
             case "cognito-idp" -> handleCognitoQuery(action, formParams, region);
             case "ec2" -> ec2QueryHandler.handle(action, formParams, region);
+            case "elasticloadbalancing" -> elbV2QueryHandler.handle(action, formParams, region);
+            case "autoscaling" -> autoScalingQueryHandler.handle(action, formParams, region);
             default -> xmlErrorResponse("UnknownService",
                     "Unknown or unsupported service: " + service, 400);
         };
@@ -222,7 +267,7 @@ public class AwsQueryController {
      */
     private static final Set<String> ELASTICACHE_ACTIONS = Set.of(
             "ValidateIamAuthToken",
-            "CreateReplicationGroup", "DescribeReplicationGroups", "DeleteReplicationGroup",
+            "CreateReplicationGroup", "DescribeReplicationGroups", "ModifyReplicationGroup", "DeleteReplicationGroup",
             "CreateUser", "DescribeUsers", "ModifyUser", "DeleteUser"
     );
 
@@ -242,7 +287,7 @@ public class AwsQueryController {
 
     private static final Set<String> CLOUDFORMATION_ACTIONS = Set.of(
             "CreateStack", "DeleteStack", "UpdateStack", "DescribeStacks",
-            "ListStacks", "GetTemplate", "ValidateTemplate",
+            "ListStacks", "ListExports", "GetTemplate", "ValidateTemplate",
             "CreateChangeSet", "DeleteChangeSet", "DescribeChangeSet", "ExecuteChangeSet", "ListChangeSets",
             "DescribeStackEvents", "DescribeStackResources", "ListStackResources", "DescribeStackResource",
             "SetStackPolicy", "GetStackPolicy", "ListStackSets", "DescribeStackSet", "CreateStackSet"
@@ -254,30 +299,38 @@ public class AwsQueryController {
             "SendEmail", "SendRawEmail", "GetSendQuota", "GetSendStatistics",
             "GetAccountSendingEnabled", "ListVerifiedEmailAddresses", "DeleteVerifiedEmailAddress",
             "SetIdentityNotificationTopic", "GetIdentityNotificationAttributes",
-            "GetIdentityDkimAttributes"
+            "SetIdentityFeedbackForwardingEnabled",
+            "SetIdentityHeadersInNotificationsEnabled",
+            "SetIdentityMailFromDomain", "GetIdentityMailFromDomainAttributes",
+            "GetIdentityDkimAttributes",
+            "CreateTemplate", "UpdateTemplate", "GetTemplate", "DeleteTemplate",
+            "ListTemplates", "SendTemplatedEmail", "SendBulkTemplatedEmail",
+            "TestRenderTemplate",
+            "CreateConfigurationSet", "DescribeConfigurationSet",
+            "ListConfigurationSets", "DeleteConfigurationSet"
     );
 
     private static final Set<String> COGNITO_ACTIONS = Set.of(
             "AdminCreateUser", "AdminGetUser", "AdminDeleteUser", "AdminSetUserPassword",
             "AdminUpdateUserAttributes", "AdminUserGlobalSignOut", "ListUsers",
-            "InitiateAuth", "AdminInitiateAuth", "RespondToAuthChallenge",
+            "InitiateAuth", "AdminInitiateAuth", "RespondToAuthChallenge", "AdminRespondToAuthChallenge",
             "SignUp", "ConfirmSignUp", "ChangePassword", "ForgotPassword",
             "ConfirmForgotPassword", "GetUser", "UpdateUserAttributes",
-            "CreateUserPool", "DescribeUserPool", "ListUserPools", "DeleteUserPool",
+            "CreateUserPool", "DescribeUserPool", "ListUserPools", "UpdateUserPool", "DeleteUserPool",
+            "TagResource", "UntagResource", "ListTagsForResource",
             "CreateUserPoolClient", "DescribeUserPoolClient", "ListUserPoolClients", "DeleteUserPoolClient",
             "CreateGroup", "GetGroup", "ListGroups", "DeleteGroup",
             "AdminAddUserToGroup", "AdminRemoveUserFromGroup", "AdminListGroupsForUser"
     );
 
-    private static final Set<String> QUERY_PROTOCOL_SERVICES = Set.of("sqs", "sns", "iam", "sts", "elasticache", "rds", "monitoring", "cloudformation", "email", "cognito-idp", "ec2");
-
     private String resolveService(String authorization, String action) {
         if (authorization != null && !authorization.isEmpty()) {
             Matcher m = SERVICE_PATTERN.matcher(authorization);
             if (m.find()) {
-                String svc = m.group(1).toLowerCase();
-                if (QUERY_PROTOCOL_SERVICES.contains(svc)) {
-                    return svc;
+                String scope = m.group(1).toLowerCase();
+                ServiceDescriptor descriptor = catalog.byCredentialScope(scope).orElse(null);
+                if (descriptor != null && descriptor.supportsProtocol(ServiceProtocol.QUERY)) {
+                    return descriptor.externalKey();
                 }
             }
         }
@@ -314,6 +367,12 @@ public class AwsQueryController {
         }
         if (EC2_ACTIONS.contains(action)) {
             return "ec2";
+        }
+        if (ELB_V2_ACTIONS.contains(action)) {
+            return "elasticloadbalancing";
+        }
+        if (AUTOSCALING_ACTIONS.contains(action)) {
+            return "autoscaling";
         }
         // SQS actions are numerous and not enumerated — fall back to sqs only for
         // requests that arrived without an Authorization header (raw/test clients)

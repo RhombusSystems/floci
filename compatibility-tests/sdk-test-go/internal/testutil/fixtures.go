@@ -11,12 +11,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/pipes"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -112,6 +116,45 @@ func CloudWatchClient() *cloudwatch.Client {
 // ACMClient returns a new ACM client.
 func ACMClient() *acm.Client {
 	return acm.NewFromConfig(Config())
+}
+
+// ECRClient returns a new ECR client.
+func ECRClient() *ecr.Client {
+	return ecr.NewFromConfig(Config())
+}
+
+// PipesClient returns a new EventBridge Pipes client.
+func PipesClient() *pipes.Client {
+	return pipes.NewFromConfig(Config())
+}
+
+// RDSClient returns a new RDS client.
+func RDSClient() *rds.Client {
+	return rds.NewFromConfig(Config())
+}
+
+// CognitoClient returns a new Cognito Identity Provider client.
+func CognitoClient() *cognitoidentityprovider.Client {
+	return cognitoidentityprovider.NewFromConfig(Config())
+}
+
+// ProxyHost returns the host to use for direct TCP connections to RDS/ElastiCache proxies.
+func ProxyHost() string {
+	ep := Endpoint()
+	// Strip scheme — ep is "http://host:port" or "http://host"
+	if len(ep) > 7 && ep[:7] == "http://" {
+		ep = ep[7:]
+	}
+	// Strip port if present
+	if i := len(ep) - 1; i > 0 {
+		for i >= 0 && ep[i] != ':' {
+			i--
+		}
+		if i > 0 {
+			return ep[:i]
+		}
+	}
+	return ep
 }
 
 // MinimalZip returns a minimal Lambda deployment zip with a Node.js handler.

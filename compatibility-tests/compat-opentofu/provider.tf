@@ -34,5 +34,7 @@ provider "aws" {
     sts            = var.endpoint
     ssm            = var.endpoint
     secretsmanager = var.endpoint
+    ec2            = var.endpoint
+    route53        = var.endpoint
   }
 }

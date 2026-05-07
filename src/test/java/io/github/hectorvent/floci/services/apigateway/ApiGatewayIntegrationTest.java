@@ -218,9 +218,19 @@ class ApiGatewayIntegrationTest {
                 .body("item.id", hasItem(deploymentId));
     }
 
+    @Test @Order(18)
+    void getDeployment() {
+        given()
+                .when().get("/restapis/" + apiId + "/deployments/" + deploymentId)
+                .then()
+                .statusCode(200)
+                .body("id", equalTo(deploymentId))
+                .body("description", equalTo("v1"));
+    }
+
     // ──────────────────────────── Stages ────────────────────────────
 
-    @Test @Order(18)
+    @Test @Order(19)
     void createStage() {
         given()
                 .contentType(ContentType.JSON)
@@ -232,7 +242,7 @@ class ApiGatewayIntegrationTest {
                 .body("deploymentId", equalTo(deploymentId));
     }
 
-    @Test @Order(19)
+    @Test @Order(20)
     void getStage() {
         given()
                 .when().get("/restapis/" + apiId + "/stages/prod")
@@ -241,7 +251,7 @@ class ApiGatewayIntegrationTest {
                 .body("stageName", equalTo("prod"));
     }
 
-    @Test @Order(20)
+    @Test @Order(21)
     void listStages() {
         given()
                 .when().get("/restapis/" + apiId + "/stages")
@@ -250,7 +260,7 @@ class ApiGatewayIntegrationTest {
                 .body("item.stageName", hasItem("prod"));
     }
 
-    @Test @Order(21)
+    @Test @Order(22)
     void updateStage() {
         String patch = """
                 {"patchOperations":[{"op":"replace","path":"/description","value":"Production"}]}
@@ -266,7 +276,7 @@ class ApiGatewayIntegrationTest {
 
     // ──────────────────────────── Tags ────────────────────────────
 
-    @Test @Order(22)
+    @Test @Order(23)
     void tagResource() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -278,6 +288,18 @@ class ApiGatewayIntegrationTest {
     }
 
     @Test @Order(23)
+    void tagResourcePostReturns405() {
+        // AWS API Gateway only defines PUT for TagResource; POST is not in the spec.
+        String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
+        given()
+                .contentType(ContentType.JSON)
+                .body("{\"tags\":{\"env\":\"test\"}}")
+                .when().post("/tags/" + arn)
+                .then()
+                .statusCode(405);
+    }
+
+    @Test @Order(24)
     void getTags() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -287,7 +309,7 @@ class ApiGatewayIntegrationTest {
                 .body("tags.env", equalTo("test"));
     }
 
-    @Test @Order(24)
+    @Test @Order(25)
     void untagResource() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -305,7 +327,7 @@ class ApiGatewayIntegrationTest {
 
     // ──────────────────────────── Cleanup ────────────────────────────
 
-    @Test @Order(25)
+    @Test @Order(26)
     void deleteStage() {
         given()
                 .when().delete("/restapis/" + apiId + "/stages/prod")
@@ -313,7 +335,7 @@ class ApiGatewayIntegrationTest {
                 .statusCode(202);
     }
 
-    @Test @Order(26)
+    @Test @Order(27)
     void deleteResource() {
         given()
                 .when().delete("/restapis/" + apiId + "/resources/" + resourceId)
@@ -321,7 +343,7 @@ class ApiGatewayIntegrationTest {
                 .statusCode(204);
     }
 
-    @Test @Order(27)
+    @Test @Order(28)
     void deleteRestApi() {
         given()
                 .when().delete("/restapis/" + apiId)
@@ -329,11 +351,46 @@ class ApiGatewayIntegrationTest {
                 .statusCode(202);
     }
 
-    @Test @Order(28)
+    @Test @Order(29)
     void getDeletedRestApiReturns404() {
         given()
                 .when().get("/restapis/" + apiId)
                 .then()
                 .statusCode(404);
+    }
+
+    // ──────────────────────────── _custom_id_ tag ────────────────────────────
+
+    @Test @Order(50)
+    void createRestApi_customIdTag_usesTagValueAsApiId() {
+        String body = """
+                {"name":"custom-id-api","tags":{"_custom_id_":"MYCUSTOMNAME"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(201)
+                .body("id", equalTo("MYCUSTOMNAME"))
+                .body("tags._custom_id_", equalTo("MYCUSTOMNAME"));
+    }
+
+    @Test @Order(51)
+    void getRestApi_customId_resolvesById() {
+        given()
+                .when().get("/restapis/MYCUSTOMNAME")
+                .then()
+                .statusCode(200)
+                .body("id", equalTo("MYCUSTOMNAME"))
+                .body("name", equalTo("custom-id-api"));
+    }
+
+    @Test @Order(52)
+    void deleteRestApi_customId() {
+        given()
+                .when().delete("/restapis/MYCUSTOMNAME")
+                .then()
+                .statusCode(202);
     }
 }

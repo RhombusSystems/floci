@@ -48,6 +48,7 @@ class CognitoFeaturesTest {
     private static CognitoIdentityProviderClient cognito;
 
     private static String poolId;
+    private static String poolArn;
     private static String clientId;
     private static final String USERNAME = "compat-user-" + UUID.randomUUID() + "@example.com";
     private static final String PASSWORD = "CompatPass1!";
@@ -76,11 +77,37 @@ class CognitoFeaturesTest {
     void createPool() {
         CreateUserPoolResponse resp = cognito.createUserPool(b -> b.poolName("compat-test-pool"));
         poolId = resp.userPool().id();
+        poolArn = resp.userPool().arn();
         assertThat(poolId).isNotBlank();
+        assertThat(poolArn).isNotBlank();
     }
 
     @Test
     @Order(2)
+    void tagListAndUntagResourceRoundTrip() {
+        cognito.tagResource(b -> b.resourceArn(poolArn).tags(Map.of("env", "test", "team", "platform")));
+
+        ListTagsForResourceResponse tagged = cognito.listTagsForResource(b -> b.resourceArn(poolArn));
+        assertThat(tagged.tags()).containsEntry("env", "test").containsEntry("team", "platform");
+
+        cognito.untagResource(b -> b.resourceArn(poolArn).tagKeys("team"));
+
+        ListTagsForResourceResponse untagged = cognito.listTagsForResource(b -> b.resourceArn(poolArn));
+        assertThat(untagged.tags()).containsEntry("env", "test").doesNotContainKey("team");
+    }
+
+    @Test
+    @Order(3)
+    void tagResourceRejectsReservedKey() {
+        assertThatThrownBy(() -> cognito.tagResource(b -> b
+                .resourceArn(poolArn)
+                .tags(Map.of("floci:override-id", "late-id"))))
+                .isInstanceOf(CognitoIdentityProviderException.class)
+                .hasMessageContaining("Reserved tag keys with prefix floci:");
+    }
+
+    @Test
+    @Order(4)
     void createClient() {
         CreateUserPoolClientResponse resp = cognito.createUserPoolClient(b -> b
                 .userPoolId(poolId)
@@ -93,7 +120,7 @@ class CognitoFeaturesTest {
     }
 
     @Test
-    @Order(3)
+    @Order(5)
     void createUserWithPermPassword() {
         cognito.adminCreateUser(b -> b
                 .userPoolId(poolId)
@@ -353,6 +380,64 @@ class CognitoFeaturesTest {
                 .userPoolId(poolId)
                 .filter("email = \"nobody@nowhere.invalid\""));
         assertThat(resp.users()).isEmpty();
+    }
+
+    @Test
+    @Order(55)
+    void describeUserPoolReturnsAllTwentyStandardAttributes() {
+        DescribeUserPoolResponse resp = cognito.describeUserPool(b -> b.userPoolId(poolId));
+        List<SchemaAttributeType> schema = resp.userPool().schemaAttributes();
+        assertThat(schema).hasSize(20);
+        List<String> names = schema.stream().map(SchemaAttributeType::name).toList();
+        assertThat(names).contains(
+                "sub", "name", "given_name", "family_name", "middle_name", "nickname",
+                "preferred_username", "profile", "picture", "website", "email",
+                "email_verified", "gender", "birthdate", "zoneinfo", "locale",
+                "phone_number", "phone_number_verified", "address", "updated_at");
+
+        SchemaAttributeType sub = schema.stream().filter(a -> "sub".equals(a.name())).findFirst().orElseThrow();
+        assertThat(sub.required()).isTrue();
+        assertThat(sub.mutable()).isFalse();
+    }
+
+    // ── AdminRespondToAuthChallenge ─────────────────────────────────────────
+
+    @Test
+    @Order(60)
+    void adminRespondToAuthChallengeNewPasswordRequired() {
+        String tempUser = "admin-challenge-user-" + java.util.UUID.randomUUID();
+        String tempPassword = "TempPass1!";
+        String newPassword = "Permanent99!";
+
+        cognito.adminCreateUser(b -> b
+                .userPoolId(poolId)
+                .username(tempUser)
+                .temporaryPassword(tempPassword)
+                .userAttributes(AttributeType.builder().name("email").value(tempUser + "@example.com").build())
+                .messageAction(MessageActionType.SUPPRESS));
+
+        AdminInitiateAuthResponse initResp = cognito.adminInitiateAuth(b -> b
+                .userPoolId(poolId)
+                .clientId(clientId)
+                .authFlow(AuthFlowType.ADMIN_USER_PASSWORD_AUTH)
+                .authParameters(Map.of("USERNAME", tempUser, "PASSWORD", tempPassword)));
+
+        assertThat(initResp.challengeNameAsString()).isEqualTo("NEW_PASSWORD_REQUIRED");
+        assertThat(initResp.session()).isNotBlank();
+
+        AdminRespondToAuthChallengeResponse challengeResp = cognito.adminRespondToAuthChallenge(b -> b
+                .userPoolId(poolId)
+                .clientId(clientId)
+                .challengeName(ChallengeNameType.NEW_PASSWORD_REQUIRED)
+                .session(initResp.session())
+                .challengeResponses(Map.of("USERNAME", tempUser, "NEW_PASSWORD", newPassword)));
+
+        assertThat(challengeResp.authenticationResult()).isNotNull();
+        assertThat(challengeResp.authenticationResult().accessToken()).isNotBlank();
+        assertThat(challengeResp.authenticationResult().idToken()).isNotBlank();
+        assertThat(challengeResp.authenticationResult().refreshToken()).isNotBlank();
+
+        cognito.adminDeleteUser(b -> b.userPoolId(poolId).username(tempUser));
     }
 
     // ── Issue #234 note ───────────────────────────────────────────────────────

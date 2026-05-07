@@ -32,6 +32,8 @@ class S3MultipartIntegrationTest {
             .contentType("application/octet-stream")
             .header("x-amz-meta-owner", "team-a")
             .header("x-amz-storage-class", "STANDARD_IA")
+            .header("Content-Disposition", "attachment; filename=\"multipart.bin\"")
+            .header("x-amz-server-side-encryption", "AES256")
         .when()
             .post("/" + BUCKET + "/" + KEY + "?uploads")
         .then()
@@ -125,6 +127,8 @@ class S3MultipartIntegrationTest {
             .get("/" + BUCKET + "/" + KEY)
         .then()
             .statusCode(200)
+            .header("Content-Disposition", equalTo("attachment; filename=\"multipart.bin\""))
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
             .header("x-amz-meta-owner", equalTo("team-a"))
             .header("x-amz-storage-class", equalTo("STANDARD_IA"))
             .body(equalTo("Part1Data-HelloPart2Data-World"));
@@ -258,6 +262,19 @@ class S3MultipartIntegrationTest {
 
     @Test
     @Order(14)
+    void initiateMultipartUploadRejectsUnsupportedServerSideEncryption() {
+        given()
+            .header("x-amz-server-side-encryption", "totally-unsupported")
+        .when()
+            .post("/" + BUCKET + "/invalid-sse.bin?uploads")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Unsupported x-amz-server-side-encryption value"));
+    }
+
+    @Test
+    @Order(15)
     void cleanUp() {
         given().when().delete("/" + BUCKET + "/" + KEY).then().statusCode(204);
         given().when().delete("/" + BUCKET + "/source-for-copy.bin").then().statusCode(204);
