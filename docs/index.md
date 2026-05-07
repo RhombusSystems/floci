@@ -1,7 +1,7 @@
 # Floci
 
 <p align="center">
-  <img src="assets/logo.svg" alt="Floci" width="500" />
+  <img src="assets/floci.png" alt="Floci" width="500" />
 </p>
 
 <p align="center"><em>Light, fluffy, and always free</em></p>
@@ -10,14 +10,17 @@
 
 Floci is a fast, free, and open-source local AWS service emulator built for developers who need reliable AWS services in development and CI without cost, complexity, or vendor lock-in.
 
-## Supported Services 
+## Supported Services
+
+Floci emulates 45 AWS services. See the [Services Overview](services/index.md) for per-service operation counts, endpoints, and full protocol details.
 
 | Service | Protocol |
 |---|---|
 | SSM Parameter Store | JSON 1.1 |
 | SQS | Query / JSON |
 | SNS | Query / JSON |
-| SES | Query / REST JSON |
+| SES | Query |
+| SES v2 | REST JSON |
 | S3 | REST XML |
 | DynamoDB + Streams | JSON 1.1 |
 | Lambda | REST JSON |
@@ -30,11 +33,30 @@ Floci is a fast, free, and open-source local AWS service emulator built for deve
 | Step Functions | JSON 1.1 |
 | IAM | Query |
 | STS | Query |
-| ElastiCache (Redis) | Query + RESP proxy |
+| ElastiCache (Redis / Valkey) | Query + RESP proxy |
 | RDS (PostgreSQL / MySQL) | Query + wire proxy |
+| MSK (Kafka / Redpanda) | REST JSON + Kafka |
+| Athena | JSON 1.1 |
+| Glue Data Catalog + Schema Registry | JSON 1.1 |
+| Data Firehose | JSON 1.1 |
+| ECS | JSON 1.1 |
+| EC2 | EC2 Query |
+| ACM | JSON 1.1 |
+| ECR | JSON 1.1 + OCI Distribution |
+| OpenSearch | REST JSON |
 | EventBridge | JSON 1.1 |
 | EventBridge Scheduler | REST JSON |
 | CloudWatch Logs & Metrics | JSON 1.1 / Query |
+| AppConfig + AppConfigData | REST JSON |
+| Bedrock Runtime | REST JSON |
+| EKS | REST JSON |
+| ELB v2 | Query |
+| Auto Scaling | Query |
+| CodeBuild | JSON 1.1 |
+| CodeDeploy | JSON 1.1 |
+| AWS Backup | REST JSON |
+| Route53 | REST XML |
+| Transfer Family | JSON 1.1 |
 
 ## Why Floci?
 
@@ -51,7 +73,7 @@ Floci is a fast, free, and open-source local AWS service emulator built for deve
 ```yaml title="docker-compose.yml"
 services:
   floci:
-    image: hectorvent/floci:latest
+    image: floci/floci:latest
     ports:
       - "4566:4566"
     volumes:
@@ -70,7 +92,7 @@ docker compose up -d
 aws --endpoint-url http://localhost:4566 s3 mb s3://my-bucket
 ```
 
-All 19+ AWS services are immediately available at `http://localhost:4566`.
+All 45 AWS services are immediately available at `http://localhost:4566`.
 
 [Get started →](getting-started/quick-start.md){ .md-button .md-button--primary }
 [View services →](services/index.md){ .md-button }

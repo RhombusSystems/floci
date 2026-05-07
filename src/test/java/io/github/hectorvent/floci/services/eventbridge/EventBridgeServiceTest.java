@@ -9,7 +9,6 @@ import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
-
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -36,10 +35,14 @@ class EventBridgeServiceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 new RegionResolver("us-east-1", "000000000000"),
                 new ObjectMapper(),
                 null,
-                invokerMock
+                invokerMock,
+                null
         );
     }
 
@@ -400,5 +403,153 @@ class EventBridgeServiceTest {
         assertEquals(1, result.entries().size());
         assertNotNull(result.entries().getFirst().get("EventId"));
         verify(invokerMock).invokeTarget(eq(target), any(String.class), eq(REGION));
+    }
+
+    @Test
+    void matchesPatternBySourcePrefix_matches() {
+        Map<String, Object> event = Map.of("Source", "com.example.myapp", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"source\":[{\"prefix\":\"com.example\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySourcePrefix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "org.example.myapp", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"source\":[{\"prefix\":\"com.example\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySuffix_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "order.json");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"suffix\":\".json\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySuffix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "order.xml");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"suffix\":\".json\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByEqualsIgnoreCase_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "PROD");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"equals-ignore-case\":\"prod\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByEqualsIgnoreCase_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "PROD");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"equals-ignore-case\":\"dev\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingBut_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"anything-but\":[\"Payment\"]}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingBut_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Payment");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"anything-but\":[\"Payment\"]}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingButPrefix_matches() {
+        Map<String, Object> event = Map.of("Source", "com.example.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"source\":[{\"anything-but\":{\"prefix\":\"aws.\"}}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingButPrefix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "aws.events", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"source\":[{\"anything-but\":{\"prefix\":\"aws.\"}}]}"));
+    }
+
+    @Test
+    void matchesPatternByDetailPrefixField_matches() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"status\":\"CONFIRMED_BY_USER\"}"
+        );
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"status\":[{\"prefix\":\"CONFIRMED\"}]}}"));
+    }
+
+    @Test
+    void matchesPatternByExists_matches() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"status\":\"CONFIRMED\"}"
+        );
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"status\":[{\"exists\":true}]}}"));
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"other\":[{\"exists\":false}]}}"));
+    }
+
+    @Test
+    void matchesPatternByAccount_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"account\":[\"000000000000\"]}"));
+    }
+
+    @Test
+    void matchesPatternByAccount_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"account\":[\"999999999999\"]}"));
+    }
+
+    @Test
+    void matchesPatternByRegion_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"region\":[\"us-east-1\"]}"));
+    }
+
+    @Test
+    void matchesPatternByRegion_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"region\":[\"eu-west-1\"]}"));
+    }
+
+    @Test
+    void matchesPatternByNestedDetail_matches() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"object\":{\"path\":\"uploads/image.png\",\"size\":1024}}"
+        );
+        assertTrue(service.matchesPattern(event,
+                "{\"detail\":{\"object\":{\"path\":[{\"prefix\":\"uploads/\"}]}}}"));
+    }
+
+    @Test
+    void matchesPatternByNestedDetail_noMatch() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"object\":{\"path\":\"downloads/file.txt\",\"size\":1024}}"
+        );
+        assertFalse(service.matchesPattern(event,
+                "{\"detail\":{\"object\":{\"path\":[{\"prefix\":\"uploads/\"}]}}}"));
+    }
+
+    @Test
+    void matchesPatternByDeeplyNestedDetail() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"a\":{\"b\":{\"c\":\"deep-value\"}}}"
+        );
+        assertTrue(service.matchesPattern(event,
+                "{\"detail\":{\"a\":{\"b\":{\"c\":[\"deep-value\"]}}}}"));
+        assertFalse(service.matchesPattern(event,
+                "{\"detail\":{\"a\":{\"b\":{\"c\":[\"wrong\"]}}}}"));
+    }
+
+    @Test
+    void matchesPatternCombinesAccountRegionAndDetail() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "DetailType", "Order",
+                "Detail", "{\"status\":\"CONFIRMED\"}"
+        );
+        assertTrue(service.matchesPattern(event,
+                "{\"source\":[\"my.app\"],\"account\":[\"000000000000\"],\"region\":[\"us-east-1\"],\"detail\":{\"status\":[\"CONFIRMED\"]}}"));
+        assertFalse(service.matchesPattern(event,
+                "{\"source\":[\"my.app\"],\"account\":[\"999999999999\"],\"detail\":{\"status\":[\"CONFIRMED\"]}}"));
     }
 }

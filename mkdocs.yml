@@ -7,8 +7,8 @@ edit_uri: edit/main/docs/
 
 theme:
   name: material
-  logo: assets/logo.svg
-  favicon: assets/logo.svg
+  logo: assets/floci.png
+  favicon: assets/floci.png
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
@@ -59,7 +59,9 @@ nav:
     - Quick Start: getting-started/quick-start.md
     - Installation: getting-started/installation.md
     - AWS CLI & SDK Setup: getting-started/aws-setup.md
+    - Migrate from LocalStack: getting-started/migrate-from-localstack.md
   - Configuration:
+    - Docker Images: configuration/docker-images.md
     - Docker Compose: configuration/docker-compose.md
     - Ports Reference: configuration/ports.md
     - application.yml Reference: configuration/application-yml.md
@@ -85,10 +87,32 @@ nav:
     - STS: services/sts.md
     - ElastiCache: services/elasticache.md
     - RDS: services/rds.md
+    - MSK (Kafka): services/msk.md
+    - Glue: services/glue.md
+    - Athena: services/athena.md
+    - Data Firehose: services/firehose.md
     - EventBridge: services/eventbridge.md
+    - EventBridge Scheduler: services/scheduler.md
     - CloudWatch: services/cloudwatch.md
     - ACM: services/acm.md
     - ECS: services/ecs.md
+    - ECR: services/ecr.md
+    - EKS: services/eks.md
     - OpenSearch: services/opensearch.md
     - EC2: services/ec2.md
+    - AppConfig: services/appconfig.md
+    - Bedrock Runtime: services/bedrock-runtime.md
+    - ELB v2: services/elb.md
+    - Auto Scaling: services/autoscaling.md
+    - CodeBuild: services/codebuild.md
+    - CodeDeploy: services/codedeploy.md
+    - AWS Backup: services/backup.md
+    - Route53: services/route53.md
+    - Transfer Family: services/transfer.md
+  - Testcontainers:
+    - Overview: testcontainers/index.md
+    - Java: testcontainers/java.md
+    - Node.js / TypeScript: testcontainers/nodejs.md
+    - Python: testcontainers/python.md
+    - Go: testcontainers/go.md
   - Contributing: contributing.md

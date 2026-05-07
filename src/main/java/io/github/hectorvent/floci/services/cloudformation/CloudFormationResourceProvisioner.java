@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
@@ -9,9 +10,14 @@ import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
 import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.ecr.EcrService;
+import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.pipes.PipesService;
+import io.github.hectorvent.floci.services.pipes.model.DesiredState;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sns.SnsService;
@@ -54,6 +60,8 @@ public class CloudFormationResourceProvisioner {
     private final EventBridgeService eventBridgeService;
     private final ApiGatewayService apiGatewayService;
     private final ApiGatewayV2Service apiGatewayV2Service;
+    private final EcrService ecrService;
+    private final PipesService pipesService;
 
     @Inject
     public CloudFormationResourceProvisioner(S3Service s3Service, SqsService sqsService,
@@ -63,7 +71,9 @@ public class CloudFormationResourceProvisioner {
                                              SecretsManagerService secretsManagerService,
                                              EventBridgeService eventBridgeService,
                                              ApiGatewayService apiGatewayService,
-                                             ApiGatewayV2Service apiGatewayV2Service) {
+                                             ApiGatewayV2Service apiGatewayV2Service,
+                                             EcrService ecrService,
+                                             PipesService pipesService) {
         this.s3Service = s3Service;
         this.sqsService = sqsService;
         this.snsService = snsService;
@@ -76,6 +86,8 @@ public class CloudFormationResourceProvisioner {
         this.eventBridgeService = eventBridgeService;
         this.apiGatewayService = apiGatewayService;
         this.apiGatewayV2Service = apiGatewayV2Service;
+        this.ecrService = ecrService;
+        this.pipesService = pipesService;
     }
 
     /**
@@ -125,6 +137,9 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::ApiGatewayV2::Integration" -> provisionApiGatewayV2Integration(resource, properties, engine, region);
                 case "AWS::ApiGatewayV2::Stage" -> provisionApiGatewayV2Stage(resource, properties, engine, region);
                 case "AWS::ApiGatewayV2::Deployment" -> provisionApiGatewayV2Deployment(resource, properties, engine, region);
+                case "AWS::Pipes::Pipe" -> provisionPipe(resource, properties, engine, region, stackName);
+                case "AWS::Lambda::EventSourceMapping" ->
+                        provisionLambdaEventSourceMapping(resource, properties, engine, region);
                 default -> {
                     LOG.debugv("Stubbing unsupported resource type: {0} ({1})", resourceType, logicalId);
                     resource.setPhysicalId(logicalId + "-" + UUID.randomUUID().toString().substring(0, 8));
@@ -160,6 +175,10 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::Events::Rule" -> deleteEventBridgeRuleSafe(physicalId, region);
                 case "AWS::ApiGateway::RestApi" -> apiGatewayService.deleteRestApi(region, physicalId);
                 case "AWS::ApiGatewayV2::Api" -> apiGatewayV2Service.deleteApi(region, physicalId);
+                case "AWS::ECR::Repository" ->
+                        ecrService.deleteRepository(physicalId, null, true, "us-east-1");
+                case "AWS::Pipes::Pipe" -> pipesService.deletePipe(physicalId, region);
+                case "AWS::Lambda::EventSourceMapping" -> lambdaService.deleteEventSourceMapping(physicalId);
                 default -> LOG.debugv("Skipping delete of unsupported resource type: {0}", resourceType);
             }
         } catch (Exception e) {
@@ -177,7 +196,7 @@ public class CloudFormationResourceProvisioner {
         }
         s3Service.createBucket(bucketName, region);
         r.setPhysicalId(bucketName);
-        r.getAttributes().put("Arn", "arn:aws:s3:::" + bucketName);
+        r.getAttributes().put("Arn", AwsArnUtils.Arn.of("s3", "", "", bucketName).toString());
         r.getAttributes().put("DomainName", bucketName + ".s3.amazonaws.com");
         r.getAttributes().put("RegionalDomainName", bucketName + ".s3." + region + ".amazonaws.com");
         r.getAttributes().put("WebsiteURL", "http://" + bucketName + ".s3-website." + region + ".amazonaws.com");
@@ -197,7 +216,10 @@ public class CloudFormationResourceProvisioner {
             attrs.put("VisibilityTimeout", engine.resolve(props.get("VisibilityTimeout")));
         }
         var queue = sqsService.createQueue(queueName, attrs, region);
-        String queueArn = queue.getAttributes().getOrDefault("QueueArn", "");
+        // QueueArn is computed on demand in SqsService#getQueueAttributes and is not
+        // stored on the Queue object, so build it here from region + accountId + queueName.
+        // Without this, Fn::GetAtt [Queue, Arn] references resolve to an empty string.
+        String queueArn = AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
         r.setPhysicalId(queue.getQueueUrl());
         r.getAttributes().put("Arn", queueArn);
         r.getAttributes().put("QueueName", queueName);
@@ -299,7 +321,15 @@ public class CloudFormationResourceProvisioner {
             attrDefs.add(new AttributeDefinition("id", "S"));
         }
 
-        var table = dynamoDbService.createTable(tableName, keySchema, attrDefs, null, null, gsis, lsis, region);
+        TableDefinition table;
+        try {
+            table = dynamoDbService.createTable(tableName, keySchema, attrDefs, null, null, gsis, lsis, region);
+        } catch (AwsException e) {
+            if (!"ResourceInUseException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            table = dynamoDbService.describeTable(tableName, region);
+        }
         r.setPhysicalId(tableName);
         r.getAttributes().put("Arn", table.getTableArn());
         r.getAttributes().put("StreamArn", table.getTableArn() + "/stream/2024-01-01T00:00:00.000");
@@ -313,14 +343,62 @@ public class CloudFormationResourceProvisioner {
         if (funcName == null || funcName.isBlank()) {
             funcName = generatePhysicalName(stackName, r.getLogicalId(), 64, false);
         }
+        String packageType = resolveOrDefault(props, "PackageType", engine, "Zip");
+
         Map<String, Object> req = new HashMap<>();
         req.put("FunctionName", funcName);
-        req.put("Runtime", resolveOrDefault(props, "Runtime", engine, "nodejs18.x"));
-        req.put("Handler", resolveOrDefault(props, "Handler", engine, "index.handler"));
-        req.put("Role", resolveOrDefault(props, "Role", engine, "arn:aws:iam::" + accountId + ":role/default"));
+        req.put("PackageType", packageType);
+        req.put("Role", resolveOrDefault(props, "Role", engine, AwsArnUtils.Arn.of("iam", "", accountId, "role/default").toString()));
         req.put("Code", resolveLambdaCode(props, engine));
 
-        var func = lambdaService.createFunction(region, req);
+        if ("Zip".equals(packageType)) {
+            req.put("Runtime", resolveOrDefault(props, "Runtime", engine, "nodejs18.x"));
+            req.put("Handler", resolveOrDefault(props, "Handler", engine, "index.handler"));
+        } else {
+            // Image-packaged functions: forward Runtime/Handler only if explicitly set
+            String runtime = resolveOptional(props, "Runtime", engine);
+            if (runtime != null) req.put("Runtime", runtime);
+            String handler = resolveOptional(props, "Handler", engine);
+            if (handler != null) req.put("Handler", handler);
+        }
+
+        // Forward optional configuration fields when present
+        String timeout = resolveOptional(props, "Timeout", engine);
+        if (timeout != null) {
+            try { req.put("Timeout", Integer.parseInt(timeout)); } catch (NumberFormatException ignored) {}
+        }
+        String memorySize = resolveOptional(props, "MemorySize", engine);
+        if (memorySize != null) {
+            try { req.put("MemorySize", Integer.parseInt(memorySize)); } catch (NumberFormatException ignored) {}
+        }
+        String description = resolveOptional(props, "Description", engine);
+        if (description != null) {
+            req.put("Description", description);
+        }
+
+        if (props != null && props.has("Environment")) {
+            JsonNode envNode = engine.resolveNode(props.get("Environment"));
+            if (envNode != null && envNode.has("Variables")) {
+                JsonNode varsNode = envNode.get("Variables");
+                Map<String, String> vars = new HashMap<>();
+                varsNode.fields().forEachRemaining(e -> vars.put(e.getKey(), e.getValue().asText()));
+                req.put("Environment", Map.of("Variables", vars));
+            }
+        }
+
+        io.github.hectorvent.floci.services.lambda.model.LambdaFunction func;
+        try {
+            func = lambdaService.createFunction(region, req);
+        } catch (AwsException e) {
+            // CDK redeploys re-run CFN provisioning against the same Floci instance.
+            // If the function already exists, adopt it (CFN provisioning must be idempotent).
+            if ("ResourceConflictException".equals(e.getErrorCode())
+                    || (e.getMessage() != null && e.getMessage().contains("Function already exist"))) {
+                func = lambdaService.getFunction(region, funcName);
+            } else {
+                throw e;
+            }
+        }
         r.setPhysicalId(funcName);
         r.getAttributes().put("Arn", func.getFunctionArn());
     }
@@ -344,7 +422,9 @@ public class CloudFormationResourceProvisioner {
 
             String zipFile = codeNode.path("ZipFile").asText(null);
             if (zipFile != null) {
-                return Map.of("ZipFile", zipFile);
+                String handler = resolveOrDefault(props, "Handler", engine, "index.handler");
+                String runtime = resolveOrDefault(props, "Runtime", engine, "nodejs18.x");
+                return Map.of("ZipFile", sourceToZipBase64(zipFile, handler, runtime));
             }
 
             String imageUri = codeNode.path("ImageUri").asText(null);
@@ -353,6 +433,22 @@ public class CloudFormationResourceProvisioner {
             }
         }
         return Map.of("ZipFile", defaultHandlerZipBase64());
+    }
+
+    private static String sourceToZipBase64(String source, String handler, String runtime) {
+        String module = handler.contains(".") ? handler.substring(0, handler.lastIndexOf('.')) : "index";
+        String ext = runtime.startsWith("python") ? ".py" : ".js";
+        try {
+            var baos = new ByteArrayOutputStream();
+            try (var zos = new ZipOutputStream(baos)) {
+                zos.putNextEntry(new ZipEntry(module + ext));
+                zos.write(source.getBytes(StandardCharsets.UTF_8));
+                zos.closeEntry();
+            }
+            return Base64.getEncoder().encodeToString(baos.toByteArray());
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create zip from ZipFile source", e);
+        }
     }
 
     private static String defaultHandlerZipBase64() {
@@ -456,7 +552,7 @@ public class CloudFormationResourceProvisioner {
             r.getAttributes().put("Arn", profile.getArn());
         } catch (Exception e) {
             r.setPhysicalId(name);
-            r.getAttributes().put("Arn", "arn:aws:iam::" + accountId + ":instance-profile/" + name);
+            r.getAttributes().put("Arn", AwsArnUtils.Arn.of("iam", "", accountId, "instance-profile/" + name).toString());
         }
     }
 
@@ -485,7 +581,8 @@ public class CloudFormationResourceProvisioner {
     private void provisionKmsKey(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
                                  String region, String accountId) {
         String description = resolveOptional(props, "Description", engine);
-        var key = kmsService.createKey(description, region);
+        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
+        var key = kmsService.createKey(description, null, tags, region);
         r.setPhysicalId(key.getKeyId());
         r.getAttributes().put("Arn", key.getArn());
         r.getAttributes().put("KeyId", key.getKeyId());
@@ -587,8 +684,7 @@ public class CloudFormationResourceProvisioner {
     private void provisionNestedStack(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
                                       String region) {
         // Nested stacks are stubbed — return a synthetic stack ID
-        String nestedId = "arn:aws:cloudformation:" + region + "::stack/nested-" +
-                UUID.randomUUID().toString().substring(0, 8) + "/";
+        String nestedId = AwsArnUtils.Arn.of("cloudformation", region, "", "stack/nested-" + UUID.randomUUID().toString().substring(0, 8) + "/").toString();
         r.setPhysicalId(nestedId);
         r.getAttributes().put("Arn", nestedId);
         r.getAttributes().put("Outputs.BootstrapVersion", "21");
@@ -655,6 +751,71 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
+    // ── Lambda EventSourceMapping ─────────────────────────────────────────────
+
+    private void provisionLambdaEventSourceMapping(StackResource r, JsonNode props,
+                                                   CloudFormationTemplateEngine engine, String region) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("FunctionName", resolveOptional(props, "FunctionName", engine));
+        req.put("EventSourceArn", resolveOptional(props, "EventSourceArn", engine));
+
+        String enabledStr = resolveOptional(props, "Enabled", engine);
+        if (enabledStr != null) {
+            req.put("Enabled", Boolean.parseBoolean(enabledStr));
+        }
+
+        String batchSize = resolveOptional(props, "BatchSize", engine);
+        if (batchSize != null) {
+            try { req.put("BatchSize", Integer.parseInt(batchSize)); } catch (NumberFormatException ignored) {}
+        }
+
+        var esm = lambdaService.createEventSourceMapping(region, req);
+        r.setPhysicalId(esm.getUuid());
+        r.getAttributes().put("Id", esm.getUuid());
+    }
+
+    // ── Pipes ──────────────────────────────────────────────────────────────────
+
+    private void provisionPipe(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
+                               String region, String stackName) {
+        String name = resolveOptional(props, "Name", engine);
+        if (name == null || name.isBlank()) {
+            name = generatePhysicalName(stackName, r.getLogicalId(), 64, false);
+        }
+
+        String source = resolveOptional(props, "Source", engine);
+        String target = resolveOptional(props, "Target", engine);
+        String roleArn = resolveOptional(props, "RoleArn", engine);
+        String description = resolveOptional(props, "Description", engine);
+        String enrichment = resolveOptional(props, "Enrichment", engine);
+
+        String stateStr = resolveOptional(props, "DesiredState", engine);
+        DesiredState desiredState = "STOPPED".equals(stateStr) ? DesiredState.STOPPED : DesiredState.RUNNING;
+
+        JsonNode sourceParameters = null;
+        if (props != null && props.has("SourceParameters") && !props.get("SourceParameters").isNull()) {
+            sourceParameters = engine.resolveNode(props.get("SourceParameters"));
+        }
+
+        JsonNode targetParameters = null;
+        if (props != null && props.has("TargetParameters") && !props.get("TargetParameters").isNull()) {
+            targetParameters = engine.resolveNode(props.get("TargetParameters"));
+        }
+
+        JsonNode enrichmentParameters = null;
+        if (props != null && props.has("EnrichmentParameters") && !props.get("EnrichmentParameters").isNull()) {
+            enrichmentParameters = engine.resolveNode(props.get("EnrichmentParameters"));
+        }
+
+        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
+
+        var pipe = pipesService.createPipe(name, source, target, roleArn, description, desiredState,
+                enrichment, sourceParameters, targetParameters, enrichmentParameters, tags, region);
+
+        r.setPhysicalId(name);
+        r.getAttributes().put("Arn", pipe.getArn());
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void provisionCdkMetadata(StackResource r) {
@@ -695,8 +856,59 @@ public class CloudFormationResourceProvisioner {
         if (repoName == null || repoName.isBlank()) {
             repoName = generatePhysicalName(stackName, r.getLogicalId(), 256, true);
         }
+        // CDK bootstrap requires lower-case repository names; CFN-generated suffixes can include
+        // upper-case characters. Normalize to satisfy the AWS ECR repository name pattern.
+        repoName = repoName.toLowerCase();
+
+        String mutability = resolveOptional(props, "ImageTagMutability", engine);
+        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
+
+        Repository repo;
+        try {
+            repo = ecrService.createRepository(repoName, null, mutability, null, null, null, tags, "us-east-1");
+        } catch (AwsException e) {
+            if ("RepositoryAlreadyExistsException".equals(e.getErrorCode())) {
+                repo = ecrService.describeRepositories(List.of(repoName), null, "us-east-1").get(0);
+            } else {
+                throw e;
+            }
+        }
+
+        // Lifecycle policy can be inlined as `LifecyclePolicy.LifecyclePolicyText`
+        if (props != null && props.has("LifecyclePolicy")) {
+            JsonNode lp = engine.resolveNode(props.get("LifecyclePolicy"));
+            String policyText = lp.path("LifecyclePolicyText").asText(null);
+            if (policyText != null && !policyText.isEmpty()) {
+                ecrService.putLifecyclePolicy(repoName, null, policyText, "us-east-1");
+            }
+        }
+        if (props != null && props.has("RepositoryPolicyText")) {
+            JsonNode pol = engine.resolveNode(props.get("RepositoryPolicyText"));
+            String policyText = pol.isTextual() ? pol.asText() : pol.toString();
+            if (policyText != null && !policyText.isEmpty()) {
+                ecrService.setRepositoryPolicy(repoName, null, policyText, "us-east-1");
+            }
+        }
+
         r.setPhysicalId(repoName);
-        r.getAttributes().put("Arn", "arn:aws:ecr:us-east-1:000000000000:repository/" + repoName);
+        r.getAttributes().put("Arn", repo.getRepositoryArn());
+        r.getAttributes().put("RepositoryUri", repo.getRepositoryUri());
+    }
+
+    private Map<String, String> parseCfnTags(JsonNode tagsNode, CloudFormationTemplateEngine engine) {
+        Map<String, String> out = new HashMap<>();
+        if (tagsNode == null || tagsNode.isNull() || !tagsNode.isArray()) {
+            return out;
+        }
+        for (JsonNode entry : tagsNode) {
+            JsonNode resolved = engine.resolveNode(entry);
+            String key = resolved.path("Key").asText(null);
+            String value = resolved.path("Value").asText("");
+            if (key != null) {
+                out.put(key, value);
+            }
+        }
+        return out;
     }
 
     private void provisionRoute53HostedZone(StackResource r, JsonNode props, CloudFormationTemplateEngine engine) {

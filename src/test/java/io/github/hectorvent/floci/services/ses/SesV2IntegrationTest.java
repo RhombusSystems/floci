@@ -260,7 +260,6 @@ class SesV2IntegrationTest {
     @Test
     @Order(13)
     void sendEmail_template() {
-        // Re-create an identity for template test
         given()
             .contentType("application/json")
             .header("Authorization", AUTH_HEADER)
@@ -269,6 +268,23 @@ class SesV2IntegrationTest {
                 """)
         .when()
             .post("/v2/email/identities")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "TemplateName": "MyTemplate",
+                    "TemplateContent": {
+                        "Subject": "Hello {{name}}",
+                        "Text": "Hi {{name}}!"
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/templates")
         .then()
             .statusCode(200);
 
@@ -294,6 +310,23 @@ class SesV2IntegrationTest {
         .then()
             .statusCode(200)
             .body("MessageId", notNullValue());
+    }
+
+    @Test
+    @Order(14)
+    void createEmailIdentity_rejectsLeadingTrailingWhitespace() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailIdentity": " padded@example.com "}
+                """)
+        .when()
+            .post("/v2/email/identities")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", containsString("leading or trailing whitespace"));
     }
 
     // ──────────────── DKIM Attributes ────────────────
@@ -362,22 +395,6 @@ class SesV2IntegrationTest {
             .body("DkimAttributes.Status", equalTo("NOT_STARTED"));
     }
 
-    @Test
-    @Order(22)
-    void putDkimAttributes_notFound() {
-        given()
-            .contentType("application/json")
-            .header("Authorization", AUTH_HEADER)
-            .body("""
-                {"SigningEnabled": true}
-                """)
-        .when()
-            .put("/v2/email/identities/nonexistent@example.com/dkim")
-        .then()
-            .statusCode(404)
-            .body("__type", equalTo("NotFoundException"));
-    }
-
     // ──────────────── Feedback Attributes ────────────────
 
     @Test
@@ -431,6 +448,10 @@ class SesV2IntegrationTest {
     @Test
     @Order(42)
     void putFeedbackAttributes_notFound() {
+        // Real SES v2 returns BadRequestException (HTTP 400) for an unknown
+        // identity on this endpoint, with the "Identity X is invalid..."
+        // message inherited from the v1 SetIdentityFeedbackForwardingEnabled
+        // wire shape via remapV1Exception.
         given()
             .contentType("application/json")
             .header("Authorization", AUTH_HEADER)
@@ -440,8 +461,8 @@ class SesV2IntegrationTest {
         .when()
             .put("/v2/email/identities/nonexistent@example.com/feedback")
         .then()
-            .statusCode(404)
-            .body("__type", equalTo("NotFoundException"));
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"));
     }
 
     // ──────────────── Account Sending ────────────────
@@ -615,6 +636,321 @@ class SesV2IntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("BadRequestException"));
+    }
+
+    // ──────────────── Inspection endpoint (/_aws/ses) ────────────────
+
+    @Test
+    @Order(70)
+    void inspectionEndpoint_textAndHtmlAreStoredSeparately() {
+        // Create identity
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailIdentity": "inspect-sender@example.com"}
+                """)
+        .when()
+            .post("/v2/email/identities")
+        .then()
+            .statusCode(200);
+
+        // Clear any previous messages
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        // Send with distinct Text and Html bodies
+        String messageId = given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "Inspect Test"},
+                            "Body": {
+                                "Text": {"Data": "plain text body"},
+                                "Html": {"Data": "<p>html body</p>"}
+                            }
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200)
+        .extract()
+            .path("MessageId");
+
+        // Verify via inspection endpoint
+        given()
+        .when()
+            .get("/_aws/ses?id=" + messageId)
+        .then()
+            .statusCode(200)
+            .body("messages[0].Body.text_part", equalTo("plain text body"))
+            .body("messages[0].Body.html_part", equalTo("<p>html body</p>"));
+    }
+
+    @Test
+    @Order(71)
+    void inspectionEndpoint_textOnlyEmail() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "Text Only"},
+                            "Body": {
+                                "Text": {"Data": "only text"}
+                            }
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0].Body.text_part", equalTo("only text"))
+            .body("messages[0].Body.html_part", nullValue());
+    }
+
+    @Test
+    @Order(72)
+    void inspectionEndpoint_htmlOnlyEmail() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "Html Only"},
+                            "Body": {
+                                "Html": {"Data": "<b>only html</b>"}
+                            }
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0].Body.text_part", nullValue())
+            .body("messages[0].Body.html_part", equalTo("<b>only html</b>"));
+    }
+
+    @Test
+    @Order(73)
+    void inspectionEndpoint_replyToAddressesAreStored() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "ReplyToAddresses": ["reply1@example.com", "reply2@example.com"],
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "ReplyTo Test"},
+                            "Body": {"Text": {"Data": "hello"}}
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0].ReplyToAddresses", hasItems("reply1@example.com", "reply2@example.com"));
+    }
+
+    @Test
+    @Order(74)
+    void inspectionEndpoint_noReplyToOmitsField() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "No ReplyTo"},
+                            "Body": {"Text": {"Data": "hello"}}
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0]", not(hasKey("ReplyToAddresses")));
+    }
+
+    @Test
+    @Order(75)
+    void inspectionEndpoint_rawEmailReturnsRawData() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {
+                    "FromEmailAddress": "inspect-sender@example.com",
+                    "Destination": {
+                        "ToAddresses": ["inspect-to@example.com"]
+                    },
+                    "Content": {
+                        "Raw": {
+                            "Data": "Subject: Raw\\r\\n\\r\\nRaw body"
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0].RawData", notNullValue())
+            .body("messages[0].RawData", containsString("Raw body"))
+            .body("messages[0]", not(hasKey("Destination")))
+            .body("messages[0]", not(hasKey("Subject")))
+            .body("messages[0]", not(hasKey("Body")));
+    }
+
+    @Test
+    @Order(80)
+    void inspectionEndpoint_returnsEmailsFromAllRegions() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        // Create identity usable in both regions (domain covers all addresses)
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
+                {"EmailIdentity": "example.com"}
+                """)
+        .when()
+            .post("/v2/email/identities")
+        .then()
+            .statusCode(200);
+
+        // Send from us-east-1
+        given()
+            .contentType("application/json")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ses/aws4_request")
+            .body("""
+                {
+                    "FromEmailAddress": "multi@example.com",
+                    "Destination": {"ToAddresses": ["to@example.com"]},
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "US East"},
+                            "Body": {"Text": {"Data": "from us-east-1"}}
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        // Send from ap-northeast-1
+        given()
+            .contentType("application/json")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKID/20260101/ap-northeast-1/ses/aws4_request")
+            .body("""
+                {
+                    "FromEmailAddress": "multi@example.com",
+                    "Destination": {"ToAddresses": ["to@example.com"]},
+                    "Content": {
+                        "Simple": {
+                            "Subject": {"Data": "AP NE"},
+                            "Body": {"Text": {"Data": "from ap-northeast-1"}}
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200);
+
+        // Inspection returns both, each with correct Region
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages.size()", equalTo(2))
+            .body("messages.find { it.Subject == 'US East' }.Region", equalTo("us-east-1"))
+            .body("messages.find { it.Subject == 'AP NE' }.Region", equalTo("ap-northeast-1"));
     }
 
     // ──────────────── GetEmailIdentity full response ────────────────

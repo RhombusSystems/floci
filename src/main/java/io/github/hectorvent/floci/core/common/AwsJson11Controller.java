@@ -4,7 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.acm.AcmJsonHandler;
+import io.github.hectorvent.floci.services.athena.AthenaJsonHandler;
+import io.github.hectorvent.floci.services.codebuild.CodeBuildJsonHandler;
+import io.github.hectorvent.floci.services.codedeploy.CodeDeployJsonHandler;
+import io.github.hectorvent.floci.services.ecr.EcrJsonHandler;
+import io.github.hectorvent.floci.services.transfer.TransferHandler;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
+import io.github.hectorvent.floci.services.firehose.FirehoseJsonHandler;
+import io.github.hectorvent.floci.services.glue.GlueJsonHandler;
+import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingJsonHandler;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2JsonHandler;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsHandler;
 import io.github.hectorvent.floci.services.cognito.CognitoJsonHandler;
@@ -12,6 +20,7 @@ import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
 import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.kms.KmsJsonHandler;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerJsonHandler;
+import io.github.hectorvent.floci.services.ssm.Ec2MessagesJsonHandler;
 import io.github.hectorvent.floci.services.ssm.SsmJsonHandler;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
@@ -34,19 +43,8 @@ public class AwsJson11Controller {
 
     private static final Logger LOG = Logger.getLogger(AwsJson11Controller.class);
 
-    private static final String SSM_TARGET_PREFIX = "AmazonSSM.";
-    private static final String EVENTBRIDGE_TARGET_PREFIX = "AWSEvents.";
-    private static final String LOGS_TARGET_PREFIX = "Logs_20140328.";
-    private static final String SECRETS_MANAGER_TARGET_PREFIX = "secretsmanager.";
-    private static final String KINESIS_TARGET_PREFIX = "Kinesis_20131202.";
-    private static final String APIGW_V2_TARGET_PREFIX = "AmazonApiGatewayV2.";
-    private static final String KMS_TARGET_PREFIX = "TrentService.";
-    private static final String COGNITO_TARGET_PREFIX = "AWSCognitoIdentityProviderService.";
-    private static final String ACM_TARGET_PREFIX = "CertificateManager.";
-    private static final String ECS_TARGET_PREFIX = "AmazonEC2ContainerServiceV20141113.";
-    private static final String REKOGNITION_TARGET_PREFIX = "RekognitionService.";
-
     private final ObjectMapper objectMapper;
+    private final ResolvedServiceCatalog catalog;
     private final RegionResolver regionResolver;
     private final SsmJsonHandler ssmJsonHandler;
     private final EventBridgeHandler eventBridgeHandler;
@@ -58,17 +56,36 @@ public class AwsJson11Controller {
     private final CognitoJsonHandler cognitoJsonHandler;
     private final AcmJsonHandler acmJsonHandler;
     private final EcsJsonHandler ecsJsonHandler;
+    private final EcrJsonHandler ecrJsonHandler;
+    private final GlueJsonHandler glueJsonHandler;
+    private final AthenaJsonHandler athenaJsonHandler;
+    private final FirehoseJsonHandler firehoseJsonHandler;
+    private final ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler;
+    private final CodeBuildJsonHandler codeBuildJsonHandler;
+    private final CodeDeployJsonHandler codeDeployJsonHandler;
+    private final Ec2MessagesJsonHandler ec2MessagesJsonHandler;
+    private final TransferHandler transferHandler;
 
     @Inject
-    public AwsJson11Controller(ObjectMapper objectMapper, RegionResolver regionResolver,
+    public AwsJson11Controller(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
+                               RegionResolver regionResolver,
                                SsmJsonHandler ssmJsonHandler, EventBridgeHandler eventBridgeHandler,
                                CloudWatchLogsHandler cloudWatchLogsHandler,
                                SecretsManagerJsonHandler secretsManagerJsonHandler,
                                KinesisJsonHandler kinesisJsonHandler,
                                ApiGatewayV2JsonHandler apigwV2JsonHandler,
                                KmsJsonHandler kmsJsonHandler, CognitoJsonHandler cognitoJsonHandler,
-                               AcmJsonHandler acmJsonHandler, EcsJsonHandler ecsJsonHandler) {
+                               AcmJsonHandler acmJsonHandler, EcsJsonHandler ecsJsonHandler,
+                               EcrJsonHandler ecrJsonHandler, GlueJsonHandler glueJsonHandler,
+                               AthenaJsonHandler athenaJsonHandler,
+                               FirehoseJsonHandler firehoseJsonHandler,
+                               ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler,
+                               CodeBuildJsonHandler codeBuildJsonHandler,
+                               CodeDeployJsonHandler codeDeployJsonHandler,
+                               Ec2MessagesJsonHandler ec2MessagesJsonHandler,
+                               TransferHandler transferHandler) {
         this.objectMapper = objectMapper;
+        this.catalog = catalog;
         this.regionResolver = regionResolver;
         this.ssmJsonHandler = ssmJsonHandler;
         this.eventBridgeHandler = eventBridgeHandler;
@@ -80,6 +97,15 @@ public class AwsJson11Controller {
         this.cognitoJsonHandler = cognitoJsonHandler;
         this.acmJsonHandler = acmJsonHandler;
         this.ecsJsonHandler = ecsJsonHandler;
+        this.ecrJsonHandler = ecrJsonHandler;
+        this.glueJsonHandler = glueJsonHandler;
+        this.athenaJsonHandler = athenaJsonHandler;
+        this.firehoseJsonHandler = firehoseJsonHandler;
+        this.resourceGroupsTaggingJsonHandler = resourceGroupsTaggingJsonHandler;
+        this.codeBuildJsonHandler = codeBuildJsonHandler;
+        this.codeDeployJsonHandler = codeDeployJsonHandler;
+        this.ec2MessagesJsonHandler = ec2MessagesJsonHandler;
+        this.transferHandler = transferHandler;
     }
 
     @POST
@@ -94,71 +120,55 @@ public class AwsJson11Controller {
             return null;
         }
 
-        String prefix;
-        String serviceName;
-
-        if (target.startsWith(SSM_TARGET_PREFIX)) {
-            prefix = SSM_TARGET_PREFIX;
-            serviceName = "SSM";
-        } else if (target.startsWith(EVENTBRIDGE_TARGET_PREFIX)) {
-            prefix = EVENTBRIDGE_TARGET_PREFIX;
-            serviceName = "EventBridge";
-        } else if (target.startsWith(LOGS_TARGET_PREFIX)) {
-            prefix = LOGS_TARGET_PREFIX;
-            serviceName = "Logs";
-        } else if (target.startsWith(SECRETS_MANAGER_TARGET_PREFIX)) {
-            prefix = SECRETS_MANAGER_TARGET_PREFIX;
-            serviceName = "SecretsManager";
-        } else if (target.startsWith(KINESIS_TARGET_PREFIX)) {
-            prefix = KINESIS_TARGET_PREFIX;
-            serviceName = "Kinesis";
-        } else if (target.startsWith(APIGW_V2_TARGET_PREFIX)) {
-            prefix = APIGW_V2_TARGET_PREFIX;
-            serviceName = "ApiGatewayV2";
-        } else if (target.startsWith(KMS_TARGET_PREFIX)) {
-            prefix = KMS_TARGET_PREFIX;
-            serviceName = "KMS";
-        } else if (target.startsWith(COGNITO_TARGET_PREFIX)) {
-            prefix = COGNITO_TARGET_PREFIX;
-            serviceName = "Cognito";
-        } else if (target.startsWith(ACM_TARGET_PREFIX)) {
-            prefix = ACM_TARGET_PREFIX;
-            serviceName = "ACM";
-        } else if (target.startsWith(ECS_TARGET_PREFIX)) {
-            prefix = ECS_TARGET_PREFIX;
-            serviceName = "ECS";
-        } else if (target.startsWith(REKOGNITION_TARGET_PREFIX)) {
-            prefix = REKOGNITION_TARGET_PREFIX;
-            serviceName = "Rekognition";
-        } else {
+        ServiceCatalog.TargetMatch targetMatch = catalog.matchTarget(target).orElse(null);
+        if (targetMatch == null) {
             return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
         }
 
-        String action = target.substring(prefix.length());
-        LOG.infov("AwsJson11Controller {0} action: {1}", serviceName, action);
+        String serviceKey = targetMatch.descriptor().externalKey();
+        String action = targetMatch.action();
+        LOG.infov("AwsJson11Controller {0} action: {1}", serviceKey, action);
 
         try {
             JsonNode request = objectMapper.readTree(body);
             String region = regionResolver.resolveRegion(httpHeaders);
 
-            return switch (serviceName) {
-                case "SSM" -> ssmJsonHandler.handle(action, request, region);
-                case "EventBridge" -> eventBridgeHandler.handle(action, request, region);
-                case "Logs" -> cloudWatchLogsHandler.handle(action, request, region);
-                case "SecretsManager" -> secretsManagerJsonHandler.handle(action, request, region);
-                case "Kinesis" -> kinesisJsonHandler.handle(action, request, region);
-                case "ApiGatewayV2" -> apigwV2JsonHandler.handle(action, request, region);
-                case "KMS" -> kmsJsonHandler.handle(action, request, region);
-                case "Cognito" -> cognitoJsonHandler.handle(action, request, region);
-                case "ACM" -> acmJsonHandler.handle(action, request, region);
-                case "ECS" -> ecsJsonHandler.handle(action, request, region);
-                case "Rekognition" -> handleRekognitionStub(action, request);
+            Response delegated = switch (serviceKey) {
+                case "ssm" -> ssmJsonHandler.handle(action, request, region);
+                case "events" -> eventBridgeHandler.handle(action, request, region);
+                case "logs" -> cloudWatchLogsHandler.handle(action, request, region);
+                case "secretsmanager" -> secretsManagerJsonHandler.handle(action, request, region);
+                case "kinesis" -> kinesisJsonHandler.handle(action, request, region);
+                case "apigatewayv2" -> apigwV2JsonHandler.handle(action, request, region);
+                case "kms" -> kmsJsonHandler.handle(action, request, region);
+                case "cognito-idp" -> cognitoJsonHandler.handle(action, request, region);
+                case "acm" -> acmJsonHandler.handle(action, request, region);
+                case "ecs" -> ecsJsonHandler.handle(action, request, region);
+                case "ecr" -> ecrJsonHandler.handle(action, request, region);
+                case "glue" -> glueJsonHandler.handle(action, request, region);
+                case "athena" -> athenaJsonHandler.handle(action, request, region);
+                case "firehose" -> firehoseJsonHandler.handle(action, request, region);
+                case "tagging" -> resourceGroupsTaggingJsonHandler.handle(action, request, region);
+                case "codebuild" -> codeBuildJsonHandler.handle(action, request, region, regionResolver.getAccountId());
+                case "codedeploy" -> codeDeployJsonHandler.handle(action, request, region);
+                case "ec2messages" -> ec2MessagesJsonHandler.handle(action, request, region);
+                case "transfer" -> transferHandler.handle(action, request, region);
+                // Rhombus fork: stub handler for Rekognition (used by sandbox tests
+                // that exercise face/collection paths without needing real CV).
+                case "rekognition" -> handleRekognitionStub(action, request);
                 default -> null;
             };
+            // catalog.matchTarget is protocol-agnostic: a JSON 1.0 target
+            // (e.g. DynamoDB_20120810.*) can match here under @Consumes json-1.1.
+            // Return the AWS-style unknown-operation error rather than null.
+            if (delegated == null) {
+                return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+            }
+            return delegated;
         } catch (AwsException e) {
             return JsonErrorResponseUtils.createErrorResponse(e);
         } catch (Exception e) {
-            LOG.errorf("Error processing %s request", serviceName, e);
+            LOG.errorf(e, "Error processing %s request", serviceKey);
             return JsonErrorResponseUtils.createErrorResponse(e);
         }
     }

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cognito;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
@@ -36,7 +37,8 @@ class CognitoServiceTest {
                 new InMemoryStorage<>(),
                 groupStore,
                 "http://localhost:4566",
-                regionResolver
+                regionResolver,
+                null
         );
     }
 
@@ -70,6 +72,209 @@ class CognitoServiceTest {
         assertEquals(schema, pool.getSchemaAttributes());
         assertEquals(policies, pool.getPolicies());
         assertEquals(List.of("email"), pool.getUsernameAttributes());
+    }
+
+    @Test
+    void createUserPoolWithOverrideIdUsesProvidedId() {
+        UserPool pool = service.createUserPool(
+                Map.of(
+                        "PoolName", "PinnedPool",
+                        "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "us-east-1_testpool1")
+                ),
+                "us-east-1"
+        );
+
+        assertEquals("us-east-1_testpool1", pool.getId());
+        assertEquals("arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_testpool1", pool.getArn());
+    }
+
+    @Test
+    void createUserPoolWithOverrideIdStripsReservedTagOnCreate() {
+        UserPool pool = service.createUserPool(
+                Map.of(
+                        "PoolName", "PinnedPool",
+                        "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "us-east-1_testpool1", "env", "test")
+                ),
+                "us-east-1"
+        );
+
+        assertEquals(Map.of("env", "test"), pool.getUserPoolTags());
+        assertFalse(pool.getUserPoolTags().containsKey(ReservedTags.OVERRIDE_ID_KEY));
+    }
+
+    @Test
+    void createUserPoolWithDuplicateOverrideIdThrowsResourceConflict() {
+        service.createUserPool(
+                Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "us-east-1_testpool1")),
+                "us-east-1"
+        );
+
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.createUserPool(
+                        Map.of("PoolName", "PinnedPool2", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "us-east-1_testpool1")),
+                        "us-east-1"
+                )
+        );
+
+        assertEquals("ResourceConflictException", exception.getErrorCode());
+    }
+
+    @Test
+    void createUserPoolWithBlankOverrideIdThrowsValidation() {
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.createUserPool(
+                        Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "   ")),
+                        "us-east-1"
+                )
+        );
+
+        assertEquals("ValidationException", exception.getErrorCode());
+    }
+
+    @Test
+    void createUserPoolWithSlashInOverrideThrowsValidation() {
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.createUserPool(
+                        Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "bad/pool")),
+                        "us-east-1"
+                )
+        );
+
+        assertEquals("ValidationException", exception.getErrorCode());
+    }
+
+    @Test
+    void createUserPoolWithQuestionMarkOrHashInOverrideThrowsValidation() {
+        AwsException questionMarkException = assertThrows(
+                AwsException.class,
+                () -> service.createUserPool(
+                        Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "bad?pool")),
+                        "us-east-1"
+                )
+        );
+        assertEquals("ValidationException", questionMarkException.getErrorCode());
+
+        AwsException hashException = assertThrows(
+                AwsException.class,
+                () -> service.createUserPool(
+                        Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "bad#pool")),
+                        "us-east-1"
+                )
+        );
+        assertEquals("ValidationException", hashException.getErrorCode());
+    }
+
+    @Test
+    void updateUserPoolWithReservedTagStripsIt() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "PinnedPool"), "us-east-1");
+
+        service.updateUserPool(
+                Map.of(
+                        "UserPoolId", pool.getId(),
+                        "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "late-id", "env", "test")
+                ),
+                "us-east-1"
+        );
+
+        UserPool updated = service.describeUserPool(pool.getId());
+        assertEquals(Map.of("env", "test"), updated.getUserPoolTags());
+    }
+
+    @Test
+    void tagResourceAddsAndOverwritesTags() {
+        UserPool pool = service.createUserPool(
+                Map.of("PoolName", "TaggedPool", "UserPoolTags", Map.of("env", "dev")),
+                "us-east-1"
+        );
+
+        service.tagResource(pool.getArn(), Map.of("team", "platform", "env", "test"));
+
+        assertEquals(Map.of("env", "test", "team", "platform"), service.listTagsForResource(pool.getArn()));
+    }
+
+    @Test
+    void tagResourceRejectsReservedKey() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TaggedPool"), "us-east-1");
+
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.tagResource(pool.getArn(), Map.of(ReservedTags.OVERRIDE_ID_KEY, "late-id"))
+        );
+
+        assertEquals("ValidationException", exception.getErrorCode());
+    }
+
+    @Test
+    void tagResourceRejectsEmptyTags() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TaggedPool"), "us-east-1");
+
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.tagResource(pool.getArn(), Map.of())
+        );
+
+        assertEquals("InvalidParameterException", exception.getErrorCode());
+    }
+
+    @Test
+    void tagResourceWithUnknownArnThrowsNotFound() {
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> service.tagResource("arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_missing", Map.of("env", "test"))
+        );
+
+        assertEquals("ResourceNotFoundException", exception.getErrorCode());
+    }
+
+    @Test
+    void untagResourceRemovesRequestedKeysAndAllowsReservedRemoval() {
+        UserPool pool = service.createUserPool(
+                Map.of("PoolName", "TaggedPool", "UserPoolTags", Map.of("env", "test", "team", "platform")),
+                "us-east-1"
+        );
+
+        service.untagResource(pool.getArn(), List.of("team", ReservedTags.OVERRIDE_ID_KEY));
+
+        assertEquals(Map.of("env", "test"), service.listTagsForResource(pool.getArn()));
+    }
+
+    @Test
+    void listTagsForResourceReturnsCurrentTags() {
+        UserPool pool = service.createUserPool(
+                Map.of("PoolName", "TaggedPool", "UserPoolTags", Map.of("env", "test")),
+                "us-east-1"
+        );
+
+        assertEquals(Map.of("env", "test"), service.listTagsForResource(pool.getArn()));
+    }
+
+    @Test
+    void updateUserPoolAndTagResourceShareConsistentVisibleTagBehavior() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TaggedPool"), "us-east-1");
+
+        service.updateUserPool(
+                Map.of(
+                        "UserPoolId", pool.getId(),
+                        "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "late-id", "env", "test")
+                ),
+                "us-east-1"
+        );
+        service.tagResource(pool.getArn(), Map.of("team", "platform"));
+
+        assertEquals(Map.of("env", "test", "team", "platform"), service.listTagsForResource(pool.getArn()));
+    }
+
+    @Test
+    void issuerUrlForPinnedPoolResolvesAsBaseUrlSlashPoolId() {
+        UserPool pool = service.createUserPool(
+                Map.of("PoolName", "PinnedPool", "UserPoolTags", Map.of(ReservedTags.OVERRIDE_ID_KEY, "custompool")),
+                "us-east-1"
+        );
+
+        assertEquals("http://localhost:4566/custompool", service.getIssuer(pool.getId()));
     }
 
     // =========================================================================
@@ -708,5 +913,359 @@ class CognitoServiceTest {
         service.deleteUserPool(pool.getId());
 
         assertEquals(0, groupStore.scan(k -> k.startsWith(prefix)).size());
+    }
+
+    // =========================================================================
+    // Issue #433 — AdminEnableUser / AdminDisableUser
+    // =========================================================================
+
+    @Test
+    void adminDisableUserSetsEnabledFalse() {
+        UserPool pool = createPoolAndUser();
+
+        CognitoUser before = service.adminGetUser(pool.getId(), "alice");
+        assertTrue(before.isEnabled(), "User should be enabled by default");
+
+        service.adminDisableUser(pool.getId(), "alice");
+
+        CognitoUser after = service.adminGetUser(pool.getId(), "alice");
+        assertFalse(after.isEnabled(), "User should be disabled after adminDisableUser");
+    }
+
+    @Test
+    void adminEnableUserSetsEnabledTrue() {
+        UserPool pool = createPoolAndUser();
+        service.adminDisableUser(pool.getId(), "alice");
+
+        service.adminEnableUser(pool.getId(), "alice");
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "alice");
+        assertTrue(user.isEnabled(), "User should be enabled after adminEnableUser");
+    }
+
+    @Test
+    void disabledUserCannotAuthenticate() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        service.adminDisableUser(pool.getId(), "alice");
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                        Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+        assertEquals("UserNotConfirmedException", ex.getErrorCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void reEnabledUserCanAuthenticate() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        service.adminDisableUser(pool.getId(), "alice");
+        service.adminEnableUser(pool.getId(), "alice");
+
+        Map<String, Object> result = service.initiateAuth(
+                client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!"));
+        assertNotNull(((Map<String, Object>) result.get("AuthenticationResult")).get("AccessToken"));
+    }
+
+    @Test
+    void adminDisableUserNonexistentThrows() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+
+        assertThrows(AwsException.class, () ->
+                service.adminDisableUser(pool.getId(), "ghost"));
+    }
+
+    @Test
+    void adminEnableUserNonexistentThrows() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+
+        assertThrows(AwsException.class, () ->
+                service.adminEnableUser(pool.getId(), "ghost"));
+    }
+
+    // =========================================================================
+    // CUSTOM_AUTH flow (no Lambda triggers — falls back to deterministic stub)
+    // =========================================================================
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void customAuthInitiateReturnsCustomChallenge() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> result = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice", "CHALLENGE_NAME", "SRP_A"));
+
+        assertEquals("CUSTOM_CHALLENGE", result.get("ChallengeName"));
+        assertNotNull(result.get("Session"));
+        Map<String, String> params = (Map<String, String>) result.get("ChallengeParameters");
+        assertEquals("alice", params.get("USERNAME"));
+        assertEquals("SRP_A", params.get("CHALLENGE_NAME"),
+                "InitiateAuth-supplied metadata should pass through to ChallengeParameters");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void customAuthAcceptsAnyAnswerWhenNoExpectedAttribute() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> initResult = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        String session = (String) initResult.get("Session");
+
+        Map<String, Object> tokenResult = service.respondToAuthChallenge(
+                client.getClientId(), "CUSTOM_CHALLENGE", session,
+                Map.of("USERNAME", "alice", "ANSWER", "any-non-empty-answer"));
+
+        Map<String, Object> auth = (Map<String, Object>) tokenResult.get("AuthenticationResult");
+        assertNotNull(auth, "AuthenticationResult should be present after correct answer");
+        assertNotNull(auth.get("AccessToken"));
+        assertNotNull(auth.get("RefreshToken"));
+    }
+
+    @Test
+    void customAuthRejectsWhenAnswerDoesNotMatchExpectedAttribute() {
+        UserPool pool = createPoolAndUser();
+        // Stamp an expected answer attribute on the user
+        service.adminUpdateUserAttributes(pool.getId(), "alice",
+                Map.of("custom:expectedAuthAnswer", "secret-otp"));
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> initResult = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        String session = (String) initResult.get("Session");
+
+        // First wrong attempt — flow should request another challenge, not fail outright
+        Map<String, Object> retryResult = service.respondToAuthChallenge(
+                client.getClientId(), "CUSTOM_CHALLENGE", session,
+                Map.of("USERNAME", "alice", "ANSWER", "wrong"));
+        assertEquals("CUSTOM_CHALLENGE", retryResult.get("ChallengeName"));
+        String session2 = (String) retryResult.get("Session");
+
+        // Eventually correct answer issues tokens
+        @SuppressWarnings("unchecked")
+        Map<String, Object> tokenResult = service.respondToAuthChallenge(
+                client.getClientId(), "CUSTOM_CHALLENGE", session2,
+                Map.of("USERNAME", "alice", "ANSWER", "secret-otp"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> auth = (Map<String, Object>) tokenResult.get("AuthenticationResult");
+        assertNotNull(auth);
+        assertNotNull(auth.get("AccessToken"));
+    }
+
+    @Test
+    void customAuthRequiresNonEmptyAnswer() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+        Map<String, Object> initResult = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        String session = (String) initResult.get("Session");
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.respondToAuthChallenge(client.getClientId(), "CUSTOM_CHALLENGE", session,
+                        Map.of("USERNAME", "alice", "ANSWER", "")));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    @Test
+    void customChallengeWithUnknownSessionThrows() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.respondToAuthChallenge(client.getClientId(), "CUSTOM_CHALLENGE",
+                        "not-a-real-session", Map.of("USERNAME", "alice", "ANSWER", "x")));
+        assertEquals("NotAuthorizedException", ex.getErrorCode());
+    }
+
+    // =========================================================================
+    // NEW_PASSWORD_REQUIRED — challenge response shape + userAttributes updates
+    // =========================================================================
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void newPasswordRequiredChallengeReturnsUserAttributesJson() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        service.adminCreateUser(pool.getId(), "carol",
+                Map.of("email", "carol@example.com", "given_name", "Carol"), "TempPass1!");
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> result = service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "carol", "PASSWORD", "TempPass1!"));
+
+        assertEquals("NEW_PASSWORD_REQUIRED", result.get("ChallengeName"));
+        Map<String, String> params = (Map<String, String>) result.get("ChallengeParameters");
+        String userAttrsJson = params.get("userAttributes");
+        assertNotNull(userAttrsJson);
+        assertTrue(userAttrsJson.contains("\"email\":\"carol@example.com\""),
+                "userAttributes JSON should include user's email; was: " + userAttrsJson);
+        assertTrue(userAttrsJson.contains("\"given_name\":\"Carol\""),
+                "userAttributes JSON should include given_name; was: " + userAttrsJson);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void newPasswordRequiredAppliesUserAttributeUpdates() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        service.adminCreateUser(pool.getId(), "carol", Map.of("email", "carol@example.com"), "TempPass1!");
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> challengeResp = service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "carol", "PASSWORD", "TempPass1!"));
+        String session = (String) challengeResp.get("Session");
+
+        Map<String, String> responses = new HashMap<>();
+        responses.put("USERNAME", "carol");
+        responses.put("NEW_PASSWORD", "Permanent99!");
+        responses.put("userAttributes.given_name", "Carolyn");
+        responses.put("userAttributes.family_name", "Smith");
+
+        Map<String, Object> tokens = service.respondToAuthChallenge(
+                client.getClientId(), "NEW_PASSWORD_REQUIRED", session, responses);
+        assertNotNull(((Map<String, Object>) tokens.get("AuthenticationResult")).get("AccessToken"));
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "carol");
+        assertEquals("Carolyn", user.getAttributes().get("given_name"));
+        assertEquals("Smith", user.getAttributes().get("family_name"));
+        assertEquals("CONFIRMED", user.getUserStatus());
+    }
+
+    // =========================================================================
+    // SECRET_HASH validation
+    // =========================================================================
+
+    @Test
+    void initiateAuthRejectsMissingSecretHashWhenClientHasSecret() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", true, false, List.of(), List.of());
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                        Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("SECRET_HASH"));
+    }
+
+    @Test
+    void initiateAuthRejectsWrongSecretHash() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", true, false, List.of(), List.of());
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                        Map.of("USERNAME", "alice",
+                                "PASSWORD", "Perm1234!",
+                                "SECRET_HASH", "wrong-hash")));
+        assertEquals("NotAuthorizedException", ex.getErrorCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void initiateAuthAcceptsCorrectSecretHash() throws Exception {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", true, false, List.of(), List.of());
+
+        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(
+                client.getClientSecret().getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        String secretHash = Base64.getEncoder().encodeToString(
+                mac.doFinal(("alice" + client.getClientId()).getBytes(StandardCharsets.UTF_8)));
+
+        Map<String, Object> result = service.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice",
+                        "PASSWORD", "Perm1234!",
+                        "SECRET_HASH", secretHash));
+        Map<String, Object> auth = (Map<String, Object>) result.get("AuthenticationResult");
+        assertNotNull(auth);
+        assertNotNull(auth.get("AccessToken"));
+    }
+
+    // =========================================================================
+    // AdminRespondToAuthChallenge
+    // =========================================================================
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void adminRespondToAuthChallengeNewPasswordRequired() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        service.adminCreateUser(pool.getId(), "bob", Map.of("email", "bob@example.com"), "TempPass1!");
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> challengeResp = service.adminInitiateAuth(
+                pool.getId(), client.getClientId(), "ADMIN_USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "bob", "PASSWORD", "TempPass1!"), Map.of());
+        assertEquals("NEW_PASSWORD_REQUIRED", challengeResp.get("ChallengeName"));
+        String session = (String) challengeResp.get("Session");
+
+        Map<String, Object> result = service.adminRespondToAuthChallenge(
+                pool.getId(), client.getClientId(), "NEW_PASSWORD_REQUIRED", session,
+                Map.of("USERNAME", "bob", "NEW_PASSWORD", "Permanent99!"));
+        Map<String, Object> auth = (Map<String, Object>) result.get("AuthenticationResult");
+        assertNotNull(auth, "AuthenticationResult should be present");
+        assertNotNull(auth.get("AccessToken"));
+        assertNotNull(auth.get("IdToken"));
+        assertNotNull(auth.get("RefreshToken"));
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "bob");
+        assertEquals("CONFIRMED", user.getUserStatus());
+    }
+
+    @Test
+    void adminRespondToAuthChallengeInvalidPool() {
+        UserPool pool1 = service.createUserPool(Map.of("PoolName", "Pool1"), "us-east-1");
+        UserPool pool2 = service.createUserPool(Map.of("PoolName", "Pool2"), "us-east-1");
+        service.adminCreateUser(pool1.getId(), "alice", Map.of("email", "a@example.com"), "TempPass1!");
+        UserPoolClient client = service.createUserPoolClient(
+                pool1.getId(), "c", false, false, List.of(), List.of());
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                service.adminRespondToAuthChallenge(
+                        pool2.getId(), client.getClientId(), "NEW_PASSWORD_REQUIRED", null,
+                        Map.of("USERNAME", "alice", "NEW_PASSWORD", "NewPass1!")));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void adminRespondToAuthChallengeWithUserAttributes() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
+        service.adminCreateUser(pool.getId(), "carol", Map.of("email", "carol@example.com"), "TempPass1!");
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(), "c", false, false, List.of(), List.of());
+
+        Map<String, Object> challengeResp = service.adminInitiateAuth(
+                pool.getId(), client.getClientId(), "ADMIN_USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "carol", "PASSWORD", "TempPass1!"), Map.of());
+        String session = (String) challengeResp.get("Session");
+
+        Map<String, String> responses = new HashMap<>();
+        responses.put("USERNAME", "carol");
+        responses.put("NEW_PASSWORD", "Permanent99!");
+        responses.put("userAttributes.given_name", "Carolyn");
+
+        Map<String, Object> result = service.adminRespondToAuthChallenge(
+                pool.getId(), client.getClientId(), "NEW_PASSWORD_REQUIRED", session, responses);
+        assertNotNull(((Map<String, Object>) result.get("AuthenticationResult")).get("AccessToken"));
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "carol");
+        assertEquals("Carolyn", user.getAttributes().get("given_name"));
     }
 }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -11,7 +12,6 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.vertx.core.Vertx;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -68,11 +68,10 @@ public class SqsEventSourcePoller {
         this.objectMapper = objectMapper;
     }
 
-    @PostConstruct
-    void init() {
+    public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.list();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled()) {
+            if (esm.isEnabled() && esm.getEventSourceArn().contains(":sqs:")) {
                 startPolling(esm);
             }
         }
@@ -146,8 +145,18 @@ public class SqsEventSourcePoller {
 
                 String eventJson = buildSqsEvent(messages, esm);
                 LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
-                InvokeResult result = executorService.invoke(
-                        fn, eventJson.getBytes(), InvocationType.RequestResponse);
+                InvokeResult result;
+                try {
+                    result = executorService.invoke(
+                            fn, eventJson.getBytes(), InvocationType.RequestResponse);
+                } catch (AwsException e) {
+                    if ("TooManyRequestsException".equals(e.getErrorCode())) {
+                        LOG.infov("ESM {0}: function {1} throttled, messages will return to queue after visibility timeout",
+                                esm.getUuid(), fn.getFunctionName());
+                        return;
+                    }
+                    throw e;
+                }
 
                 if (result.getFunctionError() == null) {
                     Set<String> failedIds = extractBatchItemFailures(esm, result);
@@ -203,7 +212,7 @@ public class SqsEventSourcePoller {
         }
     }
 
-    private String buildSqsEvent(List<Message> messages, EventSourceMapping esm) {
+    String buildSqsEvent(List<Message> messages, EventSourceMapping esm) {
         try {
             var records = objectMapper.createArrayNode();
             for (Message msg : messages) {
@@ -213,7 +222,9 @@ public class SqsEventSourcePoller {
                 record.put("body", msg.getBody());
                 ObjectNode attrs = record.putObject("attributes");
                 attrs.put("ApproximateReceiveCount", String.valueOf(msg.getReceiveCount()));
-                attrs.put("SentTimestamp", String.valueOf(System.currentTimeMillis()));
+                attrs.put("SentTimestamp", String.valueOf(msg.getSentTimestamp().toEpochMilli()));
+                attrs.put("SenderId", AwsArnUtils.accountOrDefault(esm.getEventSourceArn(), "000000000000"));
+                attrs.put("ApproximateFirstReceiveTimestamp", String.valueOf(System.currentTimeMillis()));
                 record.putObject("messageAttributes");
                 record.put("md5OfBody", msg.getMd5OfBody() != null ? msg.getMd5OfBody() : "");
                 record.put("eventSource", "aws:sqs");
@@ -234,10 +245,6 @@ public class SqsEventSourcePoller {
      * arn:aws:sqs:REGION:ACCOUNT:QUEUE_NAME → {baseUrl}/ACCOUNT/QUEUE_NAME
      */
     public String queueArnToUrl(String arn) {
-        String[] parts = arn.split(":");
-        if (parts.length < 6) {
-            throw new IllegalArgumentException("Invalid SQS ARN: " + arn);
-        }
         return AwsArnUtils.arnToQueueUrl(arn, baseUrl);
     }
 
@@ -246,10 +253,6 @@ public class SqsEventSourcePoller {
      * arn:aws:sqs:REGION:ACCOUNT:NAME → REGION
      */
     public static String regionFromArn(String arn) {
-        String[] parts = arn.split(":");
-        if (parts.length < 4) {
-            throw new IllegalArgumentException("Invalid ARN: " + arn);
-        }
-        return parts[3];
+        return AwsArnUtils.parse(arn).region();
     }
 }

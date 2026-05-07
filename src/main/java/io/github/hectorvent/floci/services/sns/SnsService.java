@@ -179,7 +179,7 @@ public class SnsService {
         topicStore.put(key, topic);
     }
 
-    public Subscription subscribe(String topicArn, String protocol, String endpoint, String region) {
+    public Subscription subscribe(String topicArn, String protocol, String endpoint, String region, Map<String, String> attributes) {
         String topicKey = topicKey(region, topicArn);
         if (topicStore.get(topicKey).isEmpty()) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
@@ -198,6 +198,7 @@ public class SnsService {
         String subscriptionArn = topicArn + ":" + UUID.randomUUID().toString();
         Subscription subscription = new Subscription(subscriptionArn, topicArn, protocol, endpoint,
                 regionResolver.getAccountId());
+        if (attributes != null) subscription.getAttributes().putAll(attributes);
 
         if (PENDING_CONFIRMATION_PROTOCOLS.contains(protocol)) {
             String token = UUID.randomUUID().toString().replace("-", "")
@@ -209,7 +210,11 @@ public class SnsService {
         }
 
         subscriptionStore.put(subKey(region, subscriptionArn), subscription);
-        LOG.infov("Subscribed {0} ({1}) to topic {2} in {3}", endpoint, protocol, topicArn, region);
+        if (attributes == null || attributes.isEmpty()) {
+            LOG.infov("Subscribed {0} ({1}) to topic {2} in {3}", endpoint, protocol, topicArn, region);
+        } else {
+            LOG.infov("Subscribed {0} ({1}) to topic {2} in {3} with attributes: {4}", endpoint, protocol, topicArn, region, attributes);
+        }
         return subscription;
     }
 
@@ -562,6 +567,54 @@ public class SnsService {
         return false;
     }
 
+    /**
+     * Removes all FIFO deduplication cache entries for SNS topics that have an SQS subscription
+     * whose endpoint resolves to the same queue path as {@code queueUrl} (used when purging SQS
+     * with {@code clearFifoDeduplicationCacheOnPurge}).
+     */
+    public void clearFifoDeduplicationCacheForSqsQueueSubscriptions(String queueUrl, String region) {
+        String queuePath = extractQueuePathFromUrl(queueUrl);
+        if (queuePath.isEmpty()) {
+            return;
+        }
+        String subPrefix = "sub::" + region + "::";
+        subscriptionStore.keys().stream()
+                .filter(key -> key.startsWith(subPrefix))
+                .map(key -> subscriptionStore.get(key).orElse(null))
+                .filter(Objects::nonNull)
+                .filter(sub -> "sqs".equals(sub.getProtocol()))
+                .filter(sub -> sqsSubscriptionEndpointMatchesQueuePath(sub.getEndpoint(), queuePath))
+                .map(Subscription::getTopicArn)
+                .forEach(topicArn ->
+                        fifoDeduplicationCache.keySet().removeIf(cacheKey -> cacheKey.startsWith(topicArn + ":")));
+    }
+
+    private boolean sqsSubscriptionEndpointMatchesQueuePath(String endpoint, String queuePath) {
+        if (endpoint == null) {
+            return false;
+        }
+        String asUrl = sqsArnToUrl(endpoint);
+        return extractQueuePathFromUrl(asUrl).equals(queuePath);
+    }
+
+    /**
+     * Same path extraction as {@code SqsService} queue URL normalization ({@code /accountId/queueName}).
+     */
+    private static String extractQueuePathFromUrl(String url) {
+        if (url == null) {
+            return "";
+        }
+        int schemeEnd = url.indexOf("://");
+        if (schemeEnd < 0) {
+            return url;
+        }
+        int pathStart = url.indexOf('/', schemeEnd + 3);
+        if (pathStart < 0) {
+            return url;
+        }
+        return url.substring(pathStart);
+    }
+
     private List<Subscription> subscriptionsByTopic(String topicArn, String region) {
         List<Subscription> result = new ArrayList<>();
         String prefix = "sub::" + region + "::";
@@ -663,8 +716,7 @@ public class SnsService {
 
     private static String extractRegionFromArn(String arn) {
         if (arn == null || !arn.startsWith("arn:aws:")) return null;
-        String[] parts = arn.split(":");
-        return parts.length >= 4 ? parts[3] : null;
+        return AwsArnUtils.regionOrDefault(arn, null);
     }
 
     /**
@@ -709,7 +761,7 @@ public class SnsService {
     private String sqsArnToUrl(String arn) {
         if (arn == null) return null;
         if (arn.startsWith("http")) return arn;
-        if (arn.split(":").length < 6) return arn;
+        try { AwsArnUtils.parse(arn); } catch (IllegalArgumentException e) { return arn; }
         return AwsArnUtils.arnToQueueUrl(arn, baseUrl);
     }
 

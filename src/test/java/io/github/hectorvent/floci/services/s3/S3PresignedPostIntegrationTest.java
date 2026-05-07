@@ -13,6 +13,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
@@ -377,6 +378,47 @@ class S3PresignedPostIntegrationTest {
     }
 
     @Test
+    @Order(94)
+    void presignedPostReturnsXmlErrorResponseBody() {
+        // Verify the raw XML wire format matches what AWS S3 and LocalStack return.
+        // This ensures clients that parse the raw response body (e.g. seadn) see the
+        // expected XML structure with &quot;-encoded quotes, not JSON.
+        String key = "uploads/xml-error-check.png";
+        String fileContent = "not a real png";
+
+        String policy = buildPolicy(BUCKET, key, "image/png", 0, 10485760);
+        String policyBase64 = Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
+
+        String responseBody =
+            given()
+                .multiPart("key", key)
+                .multiPart("Content-Type", "image/gif")
+                .multiPart("policy", policyBase64)
+                .multiPart("x-amz-algorithm", "AWS4-HMAC-SHA256")
+                .multiPart("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20260330/us-east-1/s3/aws4_request")
+                .multiPart("x-amz-date", AMZ_DATE_FORMAT.format(Instant.now()))
+                .multiPart("x-amz-signature", "dummysignature")
+                .multiPart("file", "xml-error-check.png", fileContent.getBytes(StandardCharsets.UTF_8), "image/gif")
+            .when()
+                .post("/" + BUCKET)
+            .then()
+                .statusCode(403)
+                .contentType("application/xml")
+                .extract().body().asString();
+
+        // Assert the exact XML structure, matching what AWS S3 and LocalStack return.
+        // The RequestId is a random UUID, so we match it with a regex.
+        assertThat(responseBody, matchesRegex(
+                "\\Q<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\E"
+                        + "\\Q<Error>\\E"
+                        + "\\Q<Code>AccessDenied</Code>\\E"
+                        + "\\Q<Message>Invalid according to Policy: Policy Condition failed: \\E"
+                        + "\\Q[&quot;eq&quot;, &quot;$Content-Type&quot;, &quot;image/png&quot;]</Message>\\E"
+                        + "<RequestId>[0-9a-f\\-]+</RequestId>"
+                        + "\\Q</Error>\\E"));
+    }
+
+    @Test
     @Order(95)
     void presignedPostEnforcesPolicyWithCapitalPFieldName() {
         // The AWS SDK sends the policy field as "Policy" (capital P).
@@ -435,6 +477,40 @@ class S3PresignedPostIntegrationTest {
     }
 
     @Test
+    @Order(97)
+    void presignedPostPersistsUserMetadata() {
+        String key = "uploads/with-metadata.txt";
+        String fileContent = "metadata test";
+
+        String policy = buildPolicy(BUCKET, key, "text/plain", 0, 10485760);
+        String policyBase64 = Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
+
+        given()
+            .multiPart("key", key)
+            .multiPart("Content-Type", "text/plain")
+            .multiPart("policy", policyBase64)
+            .multiPart("x-amz-algorithm", "AWS4-HMAC-SHA256")
+            .multiPart("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20260330/us-east-1/s3/aws4_request")
+            .multiPart("x-amz-date", AMZ_DATE_FORMAT.format(Instant.now()))
+            .multiPart("x-amz-signature", "dummysignature")
+            .multiPart("x-amz-meta-source", "camera")
+            .multiPart("x-amz-meta-owner", "test-user")
+            .multiPart("file", "with-metadata.txt", fileContent.getBytes(StandardCharsets.UTF_8), "text/plain")
+        .when()
+            .post("/" + BUCKET)
+        .then()
+            .statusCode(204);
+
+        given()
+        .when()
+            .head("/" + BUCKET + "/" + key)
+        .then()
+            .statusCode(200)
+            .header("x-amz-meta-source", equalTo("camera"))
+            .header("x-amz-meta-owner", equalTo("test-user"));
+    }
+
+    @Test
     @Order(100)
     void cleanupBucket() {
         // Delete all objects
@@ -445,6 +521,7 @@ class S3PresignedPostIntegrationTest {
         given().delete("/" + BUCKET + "/uploads/within-range.txt");
         given().delete("/" + BUCKET + "/uploads/prefix-test.txt");
         given().delete("/" + BUCKET + "/uploads/capital-p-ok.txt");
+        given().delete("/" + BUCKET + "/uploads/with-metadata.txt");
 
         given()
         .when()

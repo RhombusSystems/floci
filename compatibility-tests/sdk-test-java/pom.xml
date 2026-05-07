@@ -60,6 +60,10 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3control</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>ssm</artifactId>
         </dependency>
         <dependency>
@@ -104,6 +108,27 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>athena</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>glue</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.glue</groupId>
+            <artifactId>schema-registry-serde</artifactId>
+            <version>1.1.27</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>firehose</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>ec2</artifactId>
         </dependency>
         <dependency>
@@ -134,6 +159,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>kinesis</artifactId>
         </dependency>
+        <!-- Netty async HTTP client — required for KinesisAsyncClient (SubscribeToShard) -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>netty-nio-client</artifactId>
+        </dependency>
         <!-- CloudWatch Logs client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -154,6 +184,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>ses</artifactId>
         </dependency>
+        <!-- SES V2 client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sesv2</artifactId>
+        </dependency>
         <!-- OpenSearch Service management client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -164,6 +199,26 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>ecs</artifactId>
         </dependency>
+        <!-- ECR client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>ecr</artifactId>
+        </dependency>
+        <!-- EventBridge Pipes client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>pipes</artifactId>
+        </dependency>
+        <!-- EKS client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>eks</artifactId>
+        </dependency>
+        <!-- ELBv2 client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>elasticloadbalancingv2</artifactId>
+        </dependency>
         <!-- EventBridge Scheduler client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -173,6 +228,21 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudformation</artifactId>
+        </dependency>
+        <!-- CodeBuild client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>codebuild</artifactId>
+        </dependency>
+        <!-- CodeDeploy client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>codedeploy</artifactId>
+        </dependency>
+        <!-- AWS Backup client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>backup</artifactId>
         </dependency>
         <!-- AppConfig and AppConfigData clients -->
         <dependency>
@@ -228,8 +298,11 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
+                    <!-- Include *Tests.java to also run DynamoDbScanConditionTests, EcsTests,
+                         Ec2Tests, etc. that were silently skipped by the original pattern -->
                     <includes>
                         <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
                     </includes>
                     <environmentVariables>
                         <FLOCI_ENDPOINT>${env.FLOCI_ENDPOINT}</FLOCI_ENDPOINT>

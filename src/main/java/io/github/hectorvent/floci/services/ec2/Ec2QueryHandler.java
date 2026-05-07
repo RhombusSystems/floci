@@ -12,9 +12,11 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.Base64;
 
 @ApplicationScoped
 public class Ec2QueryHandler {
@@ -50,6 +52,7 @@ public class Ec2QueryHandler {
                 case "DeleteVpc" -> handleDeleteVpc(params, region);
                 case "ModifyVpcAttribute" -> handleModifyVpcAttribute(params, region);
                 case "DescribeVpcAttribute" -> handleDescribeVpcAttribute(params, region);
+                case "DescribeVpcEndpointServices" -> handleDescribeVpcEndpointServices(params, region);
                 case "CreateDefaultVpc" -> handleCreateDefaultVpc(params, region);
                 case "AssociateVpcCidrBlock" -> handleAssociateVpcCidrBlock(params, region);
                 case "DisassociateVpcCidrBlock" -> handleDisassociateVpcCidrBlock(params, region);
@@ -107,6 +110,10 @@ public class Ec2QueryHandler {
                 case "DescribeAccountAttributes" -> handleDescribeAccountAttributes(params, region);
                 // Instance Types
                 case "DescribeInstanceTypes" -> handleDescribeInstanceTypes(params, region);
+                // Volumes
+                case "CreateVolume" -> handleCreateVolume(params, region);
+                case "DescribeVolumes" -> handleDescribeVolumes(params, region);
+                case "DeleteVolume" -> handleDeleteVolume(params, region);
                 default -> ec2Error("UnsupportedOperation",
                         "Operation " + action + " is not supported.", 400);
             };
@@ -212,6 +219,16 @@ public class Ec2QueryHandler {
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
 
+        // UserData is base64-encoded in the wire format
+        String userDataEncoded = p.getFirst("UserData");
+        String userData = null;
+        if (userDataEncoded != null && !userDataEncoded.isBlank()) {
+            userData = new String(Base64.getDecoder().decode(userDataEncoded), StandardCharsets.UTF_8);
+        }
+
+        // IamInstanceProfile
+        String iamInstanceProfileArn = p.getFirst("IamInstanceProfile.Arn");
+
         // Parse TagSpecifications
         List<Tag> instanceTags = new ArrayList<>();
         for (int i = 1; ; i++) {
@@ -228,7 +245,7 @@ public class Ec2QueryHandler {
         }
 
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
-                keyName, sgIds, subnetId, clientToken, instanceTags);
+                keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn);
 
         XmlBuilder xml = new XmlBuilder()
                 .start("RunInstancesResponse", AwsNamespaces.EC2)
@@ -419,6 +436,22 @@ public class Ec2QueryHandler {
     private Response handleCreateVpc(MultivaluedMap<String, String> p, String region) {
         String cidrBlock = p.getFirst("CidrBlock");
         Vpc vpc = service.createVpc(region, cidrBlock, false);
+        List<Tag> vpcTags = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String resType = p.getFirst("TagSpecification." + i + ".ResourceType");
+            if (resType == null) break;
+            if ("vpc".equals(resType)) {
+                for (int j = 1; ; j++) {
+                    String k = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Key");
+                    if (k == null) break;
+                    String v = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Value");
+                    vpcTags.add(new Tag(k, v));
+                }
+            }
+        }
+        if (!vpcTags.isEmpty()) {
+            service.createTags(region, List.of(vpc.getVpcId()), vpcTags);
+        }
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVpcResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -449,7 +482,13 @@ public class Ec2QueryHandler {
 
     private Response handleModifyVpcAttribute(MultivaluedMap<String, String> p, String region) {
         String vpcId = p.getFirst("VpcId");
-        service.modifyVpcAttribute(region, vpcId, "attribute", "value");
+        if (p.containsKey("EnableDnsSupport.Value")) {
+            service.modifyVpcAttribute(region, vpcId, "enableDnsSupport", p.getFirst("EnableDnsSupport.Value"));
+        } else if (p.containsKey("EnableDnsHostnames.Value")) {
+            service.modifyVpcAttribute(region, vpcId, "enableDnsHostnames", p.getFirst("EnableDnsHostnames.Value"));
+        } else if (p.containsKey("EnableNetworkAddressUsageMetrics.Value")) {
+            service.modifyVpcAttribute(region, vpcId, "enableNetworkAddressUsageMetrics", p.getFirst("EnableNetworkAddressUsageMetrics.Value"));
+        }
         return booleanResponse("ModifyVpcAttribute");
     }
 
@@ -462,11 +501,23 @@ public class Ec2QueryHandler {
                 .elem("requestId", UUID.randomUUID().toString())
                 .elem("vpcId", vpcId);
         if ("enableDnsSupport".equals(attribute)) {
-            xml.start("enableDnsSupport").elem("value", "true").end("enableDnsSupport");
+            xml.start("enableDnsSupport").elem("value", String.valueOf(vpc.isEnableDnsSupport())).end("enableDnsSupport");
         } else if ("enableDnsHostnames".equals(attribute)) {
-            xml.start("enableDnsHostnames").elem("value", "true").end("enableDnsHostnames");
+            xml.start("enableDnsHostnames").elem("value", String.valueOf(vpc.isEnableDnsHostnames())).end("enableDnsHostnames");
+        } else if ("enableNetworkAddressUsageMetrics".equals(attribute)) {
+            xml.start("enableNetworkAddressUsageMetrics").elem("value", String.valueOf(vpc.isEnableNetworkAddressUsageMetrics())).end("enableNetworkAddressUsageMetrics");
         }
         xml.end("DescribeVpcAttributeResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeVpcEndpointServices(MultivaluedMap<String, String> p, String region) {
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeVpcEndpointServicesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("serviceNameSet").end("serviceNameSet")
+                .start("serviceDetailSet").end("serviceDetailSet")
+                .end("DescribeVpcEndpointServicesResponse");
         return xmlResponse(xml.build());
     }
 
@@ -721,7 +772,8 @@ public class Ec2QueryHandler {
 
     private Response handleImportKeyPair(MultivaluedMap<String, String> p, String region) {
         String keyName = p.getFirst("KeyName");
-        String publicKeyMaterial = p.getFirst("PublicKeyMaterial");
+        String encoded = p.getFirst("PublicKeyMaterial");
+        String publicKeyMaterial = new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
         KeyPair kp = service.importKeyPair(region, keyName, publicKeyMaterial);
         XmlBuilder xml = new XmlBuilder()
                 .start("ImportKeyPairResponse", AwsNamespaces.EC2)
@@ -896,6 +948,9 @@ public class Ec2QueryHandler {
                 .start("AssociateRouteTableResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .elem("associationId", assoc.getRouteTableAssociationId())
+                .start("associationState")
+                    .elem("state", assoc.getAssociationState())
+                .end("associationState")
                 .end("AssociateRouteTableResponse");
         return xmlResponse(xml.build());
     }
@@ -1265,6 +1320,100 @@ public class Ec2QueryHandler {
                     .end("item");
         }
         xml.end("tagSet");
+        return xml.build();
+    }
+
+    // ─── Volume handlers ──────────────────────────────────────────────────────
+
+    private Response handleCreateVolume(MultivaluedMap<String, String> p, String region) {
+        String availabilityZone = p.getFirst("AvailabilityZone");
+        String volumeType = p.getFirst("VolumeType");
+        String sizeStr = p.getFirst("Size");
+        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 8;
+        String encryptedStr = p.getFirst("Encrypted");
+        boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
+        String iopsStr = p.getFirst("Iops");
+        int iops = iopsStr != null ? Integer.parseInt(iopsStr) : 0;
+        String snapshotId = p.getFirst("SnapshotId");
+
+        List<Tag> volumeTags = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String resType = p.getFirst("TagSpecification." + i + ".ResourceType");
+            if (resType == null) break;
+            if ("volume".equals(resType)) {
+                for (int j = 1; ; j++) {
+                    String k = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Key");
+                    if (k == null) break;
+                    String v = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Value");
+                    volumeTags.add(new Tag(k, v));
+                }
+            }
+        }
+
+        Volume vol = service.createVolume(region, availabilityZone, volumeType, size,
+                encrypted, iops, snapshotId, volumeTags);
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateVolumeResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .raw(volumeXml(vol))
+                .end("CreateVolumeResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
+        List<String> ids = getList(p, "VolumeId");
+        Map<String, List<String>> filters = getFilters(p);
+        List<Volume> volList = service.describeVolumes(region, ids, filters);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeVolumesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("volumeSet");
+        for (Volume vol : volList) {
+            xml.start("item").raw(volumeXml(vol)).end("item");
+        }
+        xml.end("volumeSet")
+                .elem("nextToken", "")
+                .end("DescribeVolumesResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDeleteVolume(MultivaluedMap<String, String> p, String region) {
+        service.deleteVolume(region, p.getFirst("VolumeId"));
+        return booleanResponse("DeleteVolume");
+    }
+
+    private String volumeXml(Volume vol) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("volumeId", vol.getVolumeId())
+                .elem("size", String.valueOf(vol.getSize()))
+                .elem("volumeType", vol.getVolumeType())
+                .elem("status", vol.getState())
+                .elem("availabilityZone", vol.getAvailabilityZone())
+                .elem("encrypted", String.valueOf(vol.isEncrypted()));
+        if (vol.getIops() > 0) {
+            xml.elem("iops", String.valueOf(vol.getIops()));
+        }
+        if (vol.getSnapshotId() != null) {
+            xml.elem("snapshotId", vol.getSnapshotId());
+        }
+        if (vol.getCreateTime() != null) {
+            xml.elem("createTime", ISO_FMT.format(vol.getCreateTime()));
+        }
+        xml.start("attachmentSet");
+        for (VolumeAttachment att : vol.getAttachments()) {
+            xml.start("item")
+                    .elem("volumeId", att.getVolumeId())
+                    .elem("instanceId", att.getInstanceId())
+                    .elem("device", att.getDevice())
+                    .elem("status", att.getState())
+                    .elem("deleteOnTermination", String.valueOf(att.isDeleteOnTermination()));
+            if (att.getAttachTime() != null) {
+                xml.elem("attachTime", ISO_FMT.format(att.getAttachTime()));
+            }
+            xml.end("item");
+        }
+        xml.end("attachmentSet")
+                .raw(tagSetXml(vol.getTags()));
         return xml.build();
     }
 

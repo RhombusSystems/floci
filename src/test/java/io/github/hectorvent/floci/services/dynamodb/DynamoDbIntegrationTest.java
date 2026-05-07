@@ -1,15 +1,26 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.zip.CRC32;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -797,6 +808,114 @@ class DynamoDbIntegrationTest {
             .body("__type", equalTo("ResourceNotFoundException"));
     }
 
+    // --- ConsumedCapacity tests ---
+    // These use a dedicated table to avoid ordering dependencies.
+
+    @Test
+    void getItem_withReturnConsumedCapacityTotal_returnsCapacity() {
+        // Create a dedicated table
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "CapacityTest",
+                    "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                    "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+                }
+                """)
+        .when().post("/").then().statusCode(200);
+
+        // Put an item
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "CapacityTest", "Item": {"id": {"S": "a"}, "val": {"S": "hello"}}}
+                """)
+        .when().post("/").then().statusCode(200);
+
+        // GetItem with TOTAL
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "CapacityTest",
+                    "Key": {"id": {"S": "a"}},
+                    "ReturnConsumedCapacity": "TOTAL"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.val.S", equalTo("hello"))
+            .body("ConsumedCapacity.TableName", equalTo("CapacityTest"))
+            .body("ConsumedCapacity.CapacityUnits", notNullValue());
+    }
+
+    @Test
+    void getItem_withoutReturnConsumedCapacity_omitsCapacity() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "CapacityTest",
+                    "Key": {"id": {"S": "a"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ConsumedCapacity", nullValue());
+    }
+
+    @Test
+    void putItem_withReturnConsumedCapacityTotal_returnsCapacity() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "CapacityTest",
+                    "Item": {"id": {"S": "b"}, "val": {"S": "world"}},
+                    "ReturnConsumedCapacity": "TOTAL"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ConsumedCapacity.TableName", equalTo("CapacityTest"))
+            .body("ConsumedCapacity.CapacityUnits", notNullValue());
+    }
+
+    @Test
+    void query_withReturnConsumedCapacityIndexes_returnsTableBreakdown() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.Query")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "CapacityTest",
+                    "KeyConditionExpression": "id = :id",
+                    "ExpressionAttributeValues": {":id": {"S": "a"}},
+                    "ReturnConsumedCapacity": "INDEXES"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ConsumedCapacity.TableName", equalTo("CapacityTest"))
+            .body("ConsumedCapacity.CapacityUnits", notNullValue())
+            .body("ConsumedCapacity.Table.CapacityUnits", notNullValue());
+    }
+
     @Test
     @Order(28)
     void updateItemListAppend() {
@@ -881,6 +1000,574 @@ class DynamoDbIntegrationTest {
     }
 
     @Test
+    @Order(29)
+    void deleteElementsFromStringSet() {
+        // Create table
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Put item with a String Set
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "Item": {"pk": {"S": "k1"}, "tags": {"SS": ["a", "b", "c"]}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // DELETE "a" from the set
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "Key": {"pk": {"S": "k1"}},
+                    "UpdateExpression": "DELETE tags :val",
+                    "ExpressionAttributeValues": {":val": {"SS": ["a"]}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Verify "a" was removed, "b" and "c" remain
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "Key": {"pk": {"S": "k1"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.tags.SS.size()", equalTo(2))
+            .body("Item.tags.SS", hasItems("b", "c"))
+            .body("Item.tags.SS", not(hasItem("a")));
+
+        // DELETE remaining elements to verify attribute removal on empty set
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "Key": {"pk": {"S": "k1"}},
+                    "UpdateExpression": "DELETE tags :val",
+                    "ExpressionAttributeValues": {":val": {"SS": ["b", "c"]}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Verify attribute is removed entirely (DynamoDB doesn't allow empty sets)
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteSetTable",
+                    "Key": {"pk": {"S": "k1"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.tags", nullValue());
+
+        // Cleanup
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "DeleteSetTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(30)
+    void deleteFromSetWithAddInSameExpression() {
+        // Create table
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteAddComboTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Put item with a String Set
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteAddComboTable",
+                    "Item": {"pk": {"S": "k1"}, "tags": {"SS": ["a", "b"]}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Combined: ADD "c" then DELETE "a" in the same expression
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteAddComboTable",
+                    "Key": {"pk": {"S": "k1"}},
+                    "UpdateExpression": "ADD tags :toAdd DELETE tags :toRemove",
+                    "ExpressionAttributeValues": {
+                        ":toAdd": {"SS": ["c"]},
+                        ":toRemove": {"SS": ["a"]}
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Verify: should have "b" and "c", not "a"
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "DeleteAddComboTable",
+                    "Key": {"pk": {"S": "k1"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.tags.SS.size()", equalTo(2))
+            .body("Item.tags.SS", hasItems("b", "c"))
+            .body("Item.tags.SS", not(hasItem("a")));
+
+        // Cleanup
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "DeleteAddComboTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void updateItemConditionalCheckFailedNoReturnValues() {
+        // Create a table for this test
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable1",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    
+    given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable1",
+                    "Item": {"pk": {"S": "k1"}, "testAttr": {"S": "abc"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable1",
+                    "Key": {"pk": {"S": "k1"}},
+                    "UpdateExpression": "SET testAttr = :val",
+                    "ExpressionAttributeValues": {":val": {"S": "123"}},
+                    "ConditionExpression": "attribute_exists(nonExistent)"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ConditionalCheckFailedException"))
+            .body("message", equalTo("The conditional request failed"))
+            .body("Item", is(nullValue()));
+
+        // Cleanup
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ConditionCheckTable1"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    
+
+    @Test
+    void updateItemConditionalCheckFailedAllOldReturnValues() {
+                // Create a table for this test
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable2",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable2",
+                    "Item": {"pk": {"S": "k1"}, "testAttr": {"S": "abc"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ConditionCheckTable2",
+                    "Key": {"pk": {"S": "k1"}},
+                    "UpdateExpression": "SET testAttr = :val",
+                    "ExpressionAttributeValues": {":val": {"S": "123"}},
+                    "ConditionExpression": "attribute_exists(nonExistent)",
+                    "ReturnValuesOnConditionCheckFailure" : "ALL_OLD"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .body("__type", equalTo("ConditionalCheckFailedException"))
+            .body("message", equalTo("The conditional request failed"))
+            .body("Item.testAttr.S", equalTo("abc"));
+
+        // Cleanup
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ConditionCheckTable2"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void updateAndDescribeContinuousBackups() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ContinuousBackupsTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeContinuousBackups")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ContinuousBackupsTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ContinuousBackupsDescription.ContinuousBackupsStatus", equalTo("ENABLED"))
+            .body("ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                    equalTo("DISABLED"))
+            .body("ContinuousBackupsDescription.PointInTimeRecoveryDescription.RecoveryPeriodInDays",
+                    nullValue());
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateContinuousBackups")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ContinuousBackupsTable",
+                    "PointInTimeRecoverySpecification": {
+                        "PointInTimeRecoveryEnabled": true
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ContinuousBackupsDescription.ContinuousBackupsStatus", equalTo("ENABLED"))
+            .body("ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                    equalTo("ENABLED"))
+            .body("ContinuousBackupsDescription.PointInTimeRecoveryDescription.RecoveryPeriodInDays",
+                    equalTo(35));
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeContinuousBackups")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ContinuousBackupsTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                    equalTo("ENABLED"));
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ContinuousBackupsTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void updateContinuousBackupsRejectsOutOfRangeRecoveryPeriod() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ContinuousBackupsValidationTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateContinuousBackups")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ContinuousBackupsValidationTable",
+                    "PointInTimeRecoverySpecification": {
+                        "PointInTimeRecoveryEnabled": true,
+                        "RecoveryPeriodInDays": 36
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"));
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ContinuousBackupsValidationTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    @Order(31)
+    void updateItemSetArithmeticIncrement() {
+        // Create table
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ArithmeticTable",
+                    "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "PK", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // First call: if_not_exists(counter, :start) + :inc → 60000001
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ArithmeticTable",
+                    "Key": {"PK": {"S": "LastId"}},
+                    "UpdateExpression": "SET customerId = if_not_exists(customerId, :start) + :inc",
+                    "ExpressionAttributeValues": {
+                        ":start": {"N": "60000000"},
+                        ":inc": {"N": "1"}
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Verify first increment
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ArithmeticTable",
+                    "Key": {"PK": {"S": "LastId"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.customerId.N", equalTo("60000001"));
+
+        // Second call: existing (60000001) + 1 → 60000002
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ArithmeticTable",
+                    "Key": {"PK": {"S": "LastId"}},
+                    "UpdateExpression": "SET customerId = if_not_exists(customerId, :start) + :inc",
+                    "ExpressionAttributeValues": {
+                        ":start": {"N": "60000000"},
+                        ":inc": {"N": "1"}
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // Verify second increment
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "ArithmeticTable",
+                    "Key": {"PK": {"S": "LastId"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item.customerId.N", equalTo("60000002"));
+
+        // Cleanup
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "ArithmeticTable"}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
     void unsupportedOperation() {
         given()
             .header("X-Amz-Target", "DynamoDB_20120810.CreateGlobalTable")
@@ -891,5 +1578,325 @@ class DynamoDbIntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("UnknownOperationException"));
+    }
+
+    @Test
+    void responseIncludesCorrectXAmzCrc32Header() {
+        // The AWS SDK for Go v2 DynamoDB client wraps the response body in a CRC32-verifying
+        // reader and emits "failed to close HTTP response body" warnings when the header is
+        // missing. Verify floci attaches the header on both success and error responses and
+        // that the value matches the CRC32 of the response body bytes.
+        Response listResponse = given()
+                .header("X-Amz-Target", "DynamoDB_20120810.ListTables")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body("{}")
+                .when()
+                .post("/");
+
+        listResponse.then().statusCode(200);
+        String crcHeader = listResponse.getHeader("X-Amz-Crc32");
+        assertNotNull(crcHeader, "ListTables response must carry X-Amz-Crc32");
+        assertEquals(Long.toString(crc32Of(listResponse.asByteArray())), crcHeader);
+
+        Response errorResponse = given()
+                .header("X-Amz-Target", "DynamoDB_20120810.DescribeTable")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body("{\"TableName\":\"does-not-exist-crc32-check\"}")
+                .when()
+                .post("/");
+
+        errorResponse.then().statusCode(400);
+        String errorCrc = errorResponse.getHeader("X-Amz-Crc32");
+        assertNotNull(errorCrc, "Error response must carry X-Amz-Crc32");
+        assertEquals(Long.toString(crc32Of(errorResponse.asByteArray())), errorCrc);
+    }
+
+    @Test
+    void updateItemWithSamePartitionKeyButDifferentSortKeyCreatesSeparateItems() {
+        // Reproduces GitHub issue #498: UpdateItem on a table with a sort key
+        // overwrites the existing row instead of creating a new one when the
+        // partition key matches but the sort key differs.
+        String tableName = "CoordinationTable";
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "KeySchema": [
+                        {"AttributeName": "GroupKey", "KeyType": "HASH"},
+                        {"AttributeName": "Id", "KeyType": "RANGE"}
+                    ],
+                    "AttributeDefinitions": [
+                        {"AttributeName": "GroupKey", "AttributeType": "S"},
+                        {"AttributeName": "Id", "AttributeType": "S"}
+                    ],
+                    "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Key": {"GroupKey": {"S": "leader"}, "Id": {"S": "app1"}},
+                    "UpdateExpression": "SET Owner = :1",
+                    "ExpressionAttributeValues": {":1": {"S": "owner-app1"}}
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Key": {"GroupKey": {"S": "leader"}, "Id": {"S": "app2"}},
+                    "UpdateExpression": "SET Owner = :1",
+                    "ExpressionAttributeValues": {":1": {"S": "owner-app2"}}
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.Scan")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("Count", equalTo(2))
+            .body("ScannedCount", equalTo(2));
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+    }
+
+    @Test
+    @Order(32)
+    void deletionProtectionEnabled() {
+        String tableName = "deletion-protection-test";
+
+        // Create table with DeletionProtectionEnabled = true
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "DeletionProtectionEnabled": true
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        // DescribeTable returns DeletionProtectionEnabled = true
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("Table.DeletionProtectionEnabled", equalTo(true));
+
+        // DeleteTable is blocked
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ResourceInUseException"));
+
+        // UpdateTable to disable deletion protection
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "DeletionProtectionEnabled": false
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        // DescribeTable returns DeletionProtectionEnabled = false
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("Table.DeletionProtectionEnabled", equalTo(false));
+
+        // DeleteTable now succeeds
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+    }
+
+    private static long crc32Of(byte[] bytes) {
+        CRC32 crc = new CRC32();
+        crc.update(bytes);
+        return crc.getValue();
+    }
+
+    @Test
+    @Order(33)
+    void gsiQueryPaginationWithSharedSortKey() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        String tableName = "gsi-pagination-test";
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "KeySchema": [
+                        {"AttributeName": "PK", "KeyType": "HASH"},
+                        {"AttributeName": "SK", "KeyType": "RANGE"}
+                    ],
+                    "AttributeDefinitions": [
+                        {"AttributeName": "PK",     "AttributeType": "S"},
+                        {"AttributeName": "SK",     "AttributeType": "S"},
+                        {"AttributeName": "GSI1PK", "AttributeType": "S"},
+                        {"AttributeName": "GSI1SK", "AttributeType": "S"}
+                    ],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "GlobalSecondaryIndexes": [{
+                        "IndexName": "GSI1",
+                        "KeySchema": [
+                            {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                            {"AttributeName": "GSI1SK", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "ALL"}
+                    }]
+                }
+                """.formatted(tableName))
+        .when().post("/")
+        .then().statusCode(200);
+
+        // 5 items all sharing (GSI1PK="ITEM", GSI1SK="SAME"), unique base-table PK/SK
+        for (String id : new String[]{"ITEM_a", "ITEM_b", "ITEM_c", "ITEM_d", "ITEM_e"}) {
+            given()
+                .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                    {
+                        "TableName": "%s",
+                        "Item": {
+                            "PK":     {"S": "%s"},
+                            "SK":     {"S": "DETAIL"},
+                            "GSI1PK": {"S": "ITEM"},
+                            "GSI1SK": {"S": "SAME"}
+                        }
+                    }
+                    """.formatted(tableName, id))
+            .when().post("/")
+            .then().statusCode(200);
+        }
+
+        List<String> allCollected = new ArrayList<>();
+        Set<String> seenLeks = new HashSet<>();
+        JsonNode exclusiveStartKey = null;
+        int pages = 0;
+
+        do {
+            String body;
+            if (exclusiveStartKey == null) {
+                body = """
+                    {
+                        "TableName": "%s",
+                        "IndexName": "GSI1",
+                        "KeyConditionExpression": "GSI1PK = :pk",
+                        "ExpressionAttributeValues": {":pk": {"S": "ITEM"}},
+                        "Limit": 2
+                    }
+                    """.formatted(tableName);
+            } else {
+                body = """
+                    {
+                        "TableName": "%s",
+                        "IndexName": "GSI1",
+                        "KeyConditionExpression": "GSI1PK = :pk",
+                        "ExpressionAttributeValues": {":pk": {"S": "ITEM"}},
+                        "Limit": 2,
+                        "ExclusiveStartKey": %s
+                    }
+                    """.formatted(tableName, mapper.writeValueAsString(exclusiveStartKey));
+            }
+
+            String responseBody = given()
+                .header("X-Amz-Target", "DynamoDB_20120810.Query")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body(body)
+            .when().post("/")
+            .then().statusCode(200).extract().body().asString();
+
+            JsonNode root = mapper.readTree(responseBody);
+            pages++;
+
+            for (JsonNode item : root.path("Items")) {
+                allCollected.add(item.path("PK").path("S").asText());
+            }
+
+            JsonNode lek = root.path("LastEvaluatedKey");
+            if (lek.isMissingNode() || lek.isNull()) {
+                exclusiveStartKey = null;
+            } else {
+                // LEK must contain all four keys
+                assertNotNull(lek.get("GSI1PK"), "LastEvaluatedKey missing GSI1PK");
+                assertNotNull(lek.get("GSI1SK"), "LastEvaluatedKey missing GSI1SK");
+                assertNotNull(lek.get("PK"),     "LastEvaluatedKey missing PK");
+                assertNotNull(lek.get("SK"),     "LastEvaluatedKey missing SK");
+
+                // LEK must be unique across pages — cursor must advance
+                String lekStr = lek.toString();
+                assertEquals(false, seenLeks.contains(lekStr),
+                        "LastEvaluatedKey repeated — infinite pagination loop: " + lekStr);
+                seenLeks.add(lekStr);
+                exclusiveStartKey = lek;
+            }
+        } while (exclusiveStartKey != null && pages < 10);
+
+        // All 5 distinct items returned exactly once
+        assertEquals(5, allCollected.size(), "Expected 5 items total, got: " + allCollected);
+        assertEquals(Set.of("ITEM_a", "ITEM_b", "ITEM_c", "ITEM_d", "ITEM_e"), new HashSet<>(allCollected));
+        assertEquals(3, pages, "Expected ceil(5/2)=3 pages");
     }
 }

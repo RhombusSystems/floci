@@ -30,7 +30,7 @@ sdk install java 25-open
 This project includes a Maven wrapper, so you don't need to install Maven separately:
 
 ```bash
-git clone https://github.com/hectorvent/floci.git
+git clone https://github.com/floci-io/floci.git
 cd floci
 ./mvnw quarkus:dev     # hot reload on port 4566
 ```
@@ -95,9 +95,12 @@ ln -s AGENT.md COPILOT.md
 1. Create a package under `src/main/java/.../services/<service>/`
 2. Add a Controller (follow the correct protocol — Query, JSON 1.1, REST JSON, or REST XML)
 3. Add a Service (`@ApplicationScoped`) and model POJOs
-4. Register in `ServiceRegistry`
-5. Add config entries in `EmulatorConfig.java` and `application.yml`
-6. Add integration tests in `*IntegrationTest.java`
+4. Add config entries in `EmulatorConfig.java` and `application.yml`
+5. Register a `ServiceDescriptor` in `ResolvedServiceCatalog`
+6. Wire controller/handler dispatch for the service
+7. Add integration tests in `*IntegrationTest.java`
+
+`ServiceRegistry`, `ServiceEnabledFilter`, and `StorageFactory` now resolve service metadata from the descriptor catalog. Adding a service should not require new service-keyed switch statements in those consumers.
 
 Always implement the **real AWS wire protocol** — never invent custom endpoints. The AWS SDK must work against Floci without modification.
 
@@ -144,7 +147,7 @@ git push origin release/1.1.x
 
 ### Edge builds
 
-The `edge.yml` workflow publishes a JVM-only `hectorvent/floci:edge` image from `main` every Monday at 00:00 UTC. It can also be triggered manually from the Actions tab.
+The `edge.yml` workflow publishes a JVM-only `floci/floci:edge` image from `main` every Monday at 00:00 UTC. It can also be triggered manually from the Actions tab.
 
 ## Testing Policy for Pull Requests
 

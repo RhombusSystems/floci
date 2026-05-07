@@ -16,26 +16,46 @@
 | `UpdateSchedule` | `PUT` | `/schedules/{Name}` | Update a schedule |
 | `DeleteSchedule` | `DELETE` | `/schedules/{Name}` | Delete a schedule |
 | `ListSchedules` | `GET` | `/schedules` | List schedules |
+| `TagResource` | `POST` | `/tags/{ResourceArn}` | Add tags to a schedule group |
+| `UntagResource` | `DELETE` | `/tags/{ResourceArn}?TagKeys=...` | Remove tags from a schedule group |
+| `ListTagsForResource` | `GET` | `/tags/{ResourceArn}` | List tags on a schedule group |
+
+## Schedule Invocation
+
+When `floci.services.scheduler.invocation-enabled` is `true` (the default), a
+background dispatcher fires schedule targets on time. Supported expressions:
+
+- `at(YYYY-MM-DDTHH:mm:ss)` — one-time fire; honors `ScheduleExpressionTimezone`
+  (default UTC) and `ActionAfterCompletion=DELETE`.
+- `rate(N unit)` — repeating fire (`minutes`, `hours`, `days`, `weeks`).
+- `cron(minute hour day-of-month month day-of-week year)` — AWS 6-field cron;
+  honors `ScheduleExpressionTimezone`.
+
+`State=DISABLED` schedules and schedules outside their `StartDate`/`EndDate`
+window are skipped. The dispatcher ticks every
+`floci.services.scheduler.tick-interval-seconds` (default `10`).
+
+Supported target types: SQS, Lambda, SNS, EventBridge `PutEvents`.
 
 ## Not Yet Supported
 
-- `TagResource` / `UntagResource` / `ListTagsForResource`
-- Schedule invocation (triggering targets on schedule)
+- `RetryPolicy` and `DeadLetterConfig` on failed invocations (stored but not honored)
+- `FlexibleTimeWindow` jitter (fires deterministically at the scheduled time)
 - `NextToken`-based pagination for List operations
 
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a schedule group
 aws scheduler create-schedule-group \
   --name my-group \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # List schedule groups
 aws scheduler list-schedule-groups \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Create a schedule in the default group
 aws scheduler create-schedule \
@@ -46,7 +66,7 @@ aws scheduler create-schedule \
     "Arn": "arn:aws:lambda:us-east-1:000000000000:function:my-func",
     "RoleArn": "arn:aws:iam::000000000000:role/scheduler-role"
   }' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Create a schedule with retry policy and dead-letter queue
 aws scheduler create-schedule \
@@ -59,12 +79,12 @@ aws scheduler create-schedule \
     "RetryPolicy": {"MaximumEventAgeInSeconds":3600,"MaximumRetryAttempts":5},
     "DeadLetterConfig": {"Arn":"arn:aws:sqs:us-east-1:000000000000:my-dlq"}
   }' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Get a schedule
 aws scheduler get-schedule \
   --name my-schedule \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Update a schedule
 aws scheduler update-schedule \
@@ -76,17 +96,34 @@ aws scheduler update-schedule \
     "RoleArn": "arn:aws:iam::000000000000:role/scheduler-role"
   }' \
   --state DISABLED \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Delete a schedule
 aws scheduler delete-schedule \
   --name my-schedule \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Delete a schedule group (cascades to all schedules in the group)
 aws scheduler delete-schedule-group \
   --name my-group \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
+
+# Add tags to a schedule group (tags apply to schedule groups only)
+aws scheduler tag-resource \
+  --resource-arn arn:aws:scheduler:us-east-1:000000000000:schedule-group/my-group \
+  --tags Key=env,Value=prod Key=owner,Value=Alice \
+  --endpoint-url $AWS_ENDPOINT_URL
+
+# List tags on a schedule group
+aws scheduler list-tags-for-resource \
+  --resource-arn arn:aws:scheduler:us-east-1:000000000000:schedule-group/my-group \
+  --endpoint-url $AWS_ENDPOINT_URL
+
+# Remove tags from a schedule group
+aws scheduler untag-resource \
+  --resource-arn arn:aws:scheduler:us-east-1:000000000000:schedule-group/my-group \
+  --tag-keys env owner \
+  --endpoint-url $AWS_ENDPOINT_URL
 ```
 
 ## Default Schedule Group

@@ -147,6 +147,26 @@ class S3IntegrationTest {
     }
 
     @Test
+    @Order(10)
+    void pathTraversalInUrlIsNormalizedByFramework() {
+        // Vertx normalizes raw `..` in URL paths before the application layer,
+        // so /test-bucket/../../secret.txt becomes /secret.txt at the framework level
+        // and routes to a bucket-level handler (not S3Service.putObject for test-bucket).
+        //
+        // The actual service-layer traversal guard (resolveObjectPath) is tested
+        // in S3ServiceTest.resolvePathWithTraversalThrows.
+        //
+        // Verify that the normalized path does NOT result in a 500 error.
+        given()
+            .contentType("text/plain")
+            .body("safe-data")
+        .when()
+            .put("/test-bucket/../../secret.txt")
+        .then()
+            .statusCode(not(equalTo(500)));
+    }
+
+    @Test
     @Order(11)
     void listObjectsWithPrefix() {
         given()
@@ -990,6 +1010,186 @@ class S3IntegrationTest {
         given().delete("/cache-control-bucket");
     }
 
+    // --- Content-Disposition header preservation ---
+
+    @Test
+    @Order(130)
+    void createContentDispositionBucketAndPutObject() {
+        String disposition = "attachment; filename=\"download.txt\"";
+
+        given()
+            .put("/content-disposition-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("text/plain")
+            .header("Content-Disposition", disposition)
+            .body("disposition-content")
+        .when()
+            .put("/content-disposition-bucket/disposition.txt")
+        .then()
+            .statusCode(200)
+            .header("ETag", notNullValue());
+    }
+
+    @Test
+    @Order(131)
+    void getObjectReturnsContentDisposition() {
+        given()
+        .when()
+            .get("/content-disposition-bucket/disposition.txt")
+        .then()
+            .statusCode(200)
+            .header("Content-Disposition", equalTo("attachment; filename=\"download.txt\""));
+    }
+
+    @Test
+    @Order(132)
+    void headObjectReturnsContentDisposition() {
+        given()
+        .when()
+            .head("/content-disposition-bucket/disposition.txt")
+        .then()
+            .statusCode(200)
+            .header("Content-Disposition", equalTo("attachment; filename=\"download.txt\""));
+    }
+
+    @Test
+    @Order(133)
+    void copyObjectPreservesContentDisposition() {
+        given()
+            .header("x-amz-copy-source", "/content-disposition-bucket/disposition.txt")
+        .when()
+            .put("/content-disposition-bucket/disposition-copy.txt")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"));
+
+        given()
+        .when()
+            .head("/content-disposition-bucket/disposition-copy.txt")
+        .then()
+            .statusCode(200)
+            .header("Content-Disposition", equalTo("attachment; filename=\"download.txt\""));
+    }
+
+    @Test
+    @Order(134)
+    void copyObjectReplaceContentDisposition() {
+        given()
+            .header("x-amz-copy-source", "/content-disposition-bucket/disposition.txt")
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("Content-Disposition", "inline; filename=\"inline.txt\"")
+        .when()
+            .put("/content-disposition-bucket/disposition-inline.txt")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"));
+
+        given()
+        .when()
+            .head("/content-disposition-bucket/disposition-inline.txt")
+        .then()
+            .statusCode(200)
+            .header("Content-Disposition", equalTo("inline; filename=\"inline.txt\""));
+    }
+
+    @Test
+    @Order(135)
+    void cleanupContentDispositionBucket() {
+        given().delete("/content-disposition-bucket/disposition.txt");
+        given().delete("/content-disposition-bucket/disposition-copy.txt");
+        given().delete("/content-disposition-bucket/disposition-inline.txt");
+        given().delete("/content-disposition-bucket");
+    }
+
+    // --- Server-Side Encryption header preservation ---
+
+    @Test
+    @Order(136)
+    void createSseBucketAndPutObject() {
+        given()
+            .put("/sse-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "AES256")
+            .body("encrypted-content")
+        .when()
+            .put("/sse-bucket/encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("ETag", notNullValue())
+            .header("x-amz-server-side-encryption", equalTo("AES256"));
+    }
+
+    @Test
+    @Order(137)
+    void getObjectReturnsServerSideEncryption() {
+        given()
+        .when()
+            .get("/sse-bucket/encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"));
+    }
+
+    @Test
+    @Order(138)
+    void headObjectReturnsServerSideEncryption() {
+        given()
+        .when()
+            .head("/sse-bucket/encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"));
+    }
+
+    @Test
+    @Order(139)
+    void copyObjectPreservesServerSideEncryption() {
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/encrypted.txt")
+        .when()
+            .put("/sse-bucket/encrypted-copy.txt")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"));
+
+        given()
+        .when()
+            .head("/sse-bucket/encrypted-copy.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"));
+    }
+
+    @Test
+    @Order(140)
+    void putObjectRejectsUnsupportedServerSideEncryption() {
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "totally-unsupported")
+            .body("bad encryption")
+        .when()
+            .put("/sse-bucket/invalid-encryption.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Unsupported x-amz-server-side-encryption value"));
+    }
+
+    @Test
+    @Order(141)
+    void cleanupSseBucket() {
+        given().delete("/sse-bucket/encrypted.txt");
+        given().delete("/sse-bucket/encrypted-copy.txt");
+        given().delete("/sse-bucket");
+    }
+
     // --- S3 Notification Configuration with Filter ---
 
     @Test
@@ -1143,6 +1343,72 @@ class S3IntegrationTest {
 
     @Test
     @Order(94)
+    void notificationDeliveredToQueueInDifferentRegion() {
+        String sqsAuth = "Credential=AKID/20260507/ap-southeast-2/s3/aws4_request";
+
+        String queueUrl = given()
+            .header("Authorization", sqsAuth)
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", "notif-test-queue")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            given()
+                .contentType("application/xml")
+                .queryParam("notification", "")
+                .body("""
+                    <NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <QueueConfiguration>
+                            <Id>sqs-notif</Id>
+                            <Queue>arn:aws:sqs:ap-southeast-2:000000000000:notif-test-queue</Queue>
+                            <Event>s3:ObjectCreated:*</Event>
+                        </QueueConfiguration>
+                    </NotificationConfiguration>
+                """)
+            .when()
+                .put("/notif-test-bucket")
+            .then()
+                .statusCode(200);
+
+            given()
+                .contentType("text/plain")
+                .body("hello")
+            .when()
+                .put("/notif-test-bucket/file.txt")
+            .then()
+                .statusCode(200);
+
+            given()
+                .header("Authorization", sqsAuth)
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", queueUrl)
+                .formParam("MaxNumberOfMessages", "1")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(
+                    "ReceiveMessageResponse.ReceiveMessageResult.Message.Body",
+                    allOf(containsString("notif-test-bucket"), containsString("file.txt"))
+                );
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", sqsAuth)
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", queueUrl)
+                .post("/");
+        }
+    }
+
+    @Test
+    @Order(95)
     void cleanupNotificationBucket() {
         given().delete("/notif-test-bucket");
     }
@@ -1271,5 +1537,92 @@ class S3IntegrationTest {
         given().when().delete("/pag-test-bucket/b.txt");
         given().when().delete("/pag-test-bucket/c.txt");
         given().when().delete("/pag-test-bucket");
+    }
+
+    @Test
+    @Order(120)
+    void getBucketLocation_usEast1ReturnsEmptyLocationConstraint() {
+        String bucket = "location-us-east-1-bucket";
+
+        given()
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + bucket + "?location")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<?xml")))
+            .body(containsString("<LocationConstraint"))
+            .body(not(containsString("us-east-1")));
+
+        given().when().delete("/" + bucket);
+    }
+
+    @Test
+    @Order(121)
+    void getBucketLocation_nonUsEast1ReturnsRegionInBody() {
+        String bucket = "location-eu-central-bucket";
+        String createBucketConfiguration = """
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>eu-central-1</LocationConstraint>
+                </CreateBucketConfiguration>
+                """;
+
+        given()
+            .contentType("application/xml")
+            .body(createBucketConfiguration)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/" + bucket + "?location")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<?xml")))
+            .body(containsString("eu-central-1"));
+
+        given().when().delete("/" + bucket);
+    }
+    @Test
+    void pathTraversalAttemptsReturn400() {
+        // 1. URL-encoded dots survival through Vertx but decoded by our extractObjectKey
+        given()
+                .urlEncodingEnabled(false)
+                .pathParam("bucket", "test-bucket")
+        .when()
+                .get("/{bucket}/%2e%2e/%2e%2e/secret.txt")
+        .then()
+                .statusCode(400)
+                .body(containsString("InvalidKey"));
+
+        // 2. Null byte (survives URL-decoding but fails java.nio.file.Path validation)
+        given()
+                .urlEncodingEnabled(false)
+                .pathParam("bucket", "test-bucket")
+        .when()
+                .get("/{bucket}/%00.txt")
+        .then()
+                .statusCode(400)
+                .body(containsString("InvalidKey"));
+
+        // 3. Mixed-case percent-encoded traversal (%2E instead of %2e)
+        //    Absolute paths like //etc/passwd are normalized by the HTTP server
+        //    before reaching the controller, so they can't be tested via HTTP.
+        //    They are caught at the service layer by the startsWith(bucketDir) guard.
+        given()
+                .urlEncodingEnabled(false)
+                .pathParam("bucket", "test-bucket")
+        .when()
+                .get("/{bucket}/%2E%2E/%2E%2E/secret.txt")
+        .then()
+                .statusCode(400)
+                .body(containsString("InvalidKey"));
     }
 }

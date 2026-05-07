@@ -29,6 +29,7 @@ class Ec2IntegrationTest {
     private static String rtbAssocId;
     private static String allocationId;
     private static String associationId;
+    private static String volumeId;
 
     // =========================================================================
     // Default resources
@@ -204,7 +205,7 @@ class Ec2IntegrationTest {
         given()
             .formParam("Action", "ModifyVpcAttribute")
             .formParam("VpcId", vpcId)
-            .formParam("EnableDnsSupport.Value", "true")
+            .formParam("EnableDnsSupport.Value", "false")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -224,7 +225,20 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("DescribeVpcAttributeResponse.vpcId", equalTo(vpcId));
+            .body("DescribeVpcAttributeResponse.vpcId", equalTo(vpcId))
+            .body("DescribeVpcAttributeResponse.enableDnsSupport.value", equalTo("false"));
+    }
+
+    @Test
+    @Order(14)
+    void describeVpcEndpointServices() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 
     // =========================================================================
@@ -494,6 +508,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("AssociateRouteTableResponse.associationId", startsWith("rtbassoc-"))
+            .body("AssociateRouteTableResponse.associationState.state", equalTo("associated"))
             .extract().path("AssociateRouteTableResponse.associationId");
     }
 
@@ -503,6 +518,38 @@ class Ec2IntegrationTest {
         given()
             .formParam("Action", "DescribeRouteTables")
             .formParam("RouteTableId.1", routeTableId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeRouteTablesResponse.routeTableSet.item.routeTableId", equalTo(routeTableId));
+    }
+
+    @Test
+    @Order(64)
+    void describeRouteTablesByAssociationId() {
+        given()
+            .formParam("Action", "DescribeRouteTables")
+            .formParam("Filter.1.Name", "association.route-table-association-id")
+            .formParam("Filter.1.Value.1", rtbAssocId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeRouteTablesResponse.routeTableSet.item.routeTableId", equalTo(routeTableId))
+            .body("DescribeRouteTablesResponse.routeTableSet.item.associationSet.item[0].routeTableAssociationId",
+                    equalTo(rtbAssocId));
+    }
+
+    @Test
+    @Order(65)
+    void describeRouteTablesBySubnetId() {
+        given()
+            .formParam("Action", "DescribeRouteTables")
+            .formParam("Filter.1.Name", "association.subnet-id")
+            .formParam("Filter.1.Value.1", subnetId)
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -649,7 +696,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("StopInstancesResponse.instancesSet.item.instanceId", equalTo(instanceId))
-            .body("StopInstancesResponse.instancesSet.item.currentState.name", equalTo("stopped"));
+            .body("StopInstancesResponse.instancesSet.item.currentState.name", equalTo("stopping"));
     }
 
     @Test
@@ -664,7 +711,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("StartInstancesResponse.instancesSet.item.instanceId", equalTo(instanceId))
-            .body("StartInstancesResponse.instancesSet.item.currentState.name", equalTo("running"));
+            .body("StartInstancesResponse.instancesSet.item.currentState.name", equalTo("pending"));
     }
 
     @Test
@@ -715,6 +762,156 @@ class Ec2IntegrationTest {
             .body("DescribeTagsResponse.tagSet.item.value", equalTo("test-instance"));
     }
 
+    @Test
+    @Order(92)
+    void describeTagsFilterByResourceId() {
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "resource-id")
+            .formParam("Filter.1.Value.1", instanceId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.resourceId", equalTo(instanceId))
+            .body("DescribeTagsResponse.tagSet.item.key", equalTo("Name"));
+    }
+
+    @Test
+    @Order(92)
+    void describeTagsFilterByKey() {
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "key")
+            .formParam("Filter.1.Value.1", "Name")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.key", equalTo("Name"));
+    }
+
+    @Test
+    @Order(92)
+    void describeTagsFilterByKeyNoMatch() {
+        given()
+            .formParam("Action", "DescribeTags")
+            .formParam("Filter.1.Name", "key")
+            .formParam("Filter.1.Value.1", "NonExistentKey")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTagsResponse.tagSet.item.size()", equalTo(0));
+    }
+
+    // =========================================================================
+    // Volumes
+    // =========================================================================
+
+    @Test
+    @Order(93)
+    void createVolume() {
+        volumeId = given()
+            .formParam("Action", "CreateVolume")
+            .formParam("AvailabilityZone", "us-east-1a")
+            .formParam("VolumeType", "gp2")
+            .formParam("Size", "20")
+            .formParam("TagSpecification.1.ResourceType", "volume")
+            .formParam("TagSpecification.1.Tag.1.Key", "Name")
+            .formParam("TagSpecification.1.Tag.1.Value", "test-volume")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("CreateVolumeResponse.volumeId", startsWith("vol-"))
+            .body("CreateVolumeResponse.volumeType", equalTo("gp2"))
+            .body("CreateVolumeResponse.size", equalTo("20"))
+            .body("CreateVolumeResponse.status", equalTo("available"))
+            .body("CreateVolumeResponse.availabilityZone", equalTo("us-east-1a"))
+            .body("CreateVolumeResponse.encrypted", equalTo("false"))
+        .extract().path("CreateVolumeResponse.volumeId");
+    }
+
+    @Test
+    @Order(94)
+    void describeVolumes() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("VolumeId.1", volumeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.volumeId", equalTo(volumeId))
+            .body("DescribeVolumesResponse.volumeSet.item.volumeType", equalTo("gp2"))
+            .body("DescribeVolumesResponse.volumeSet.item.size", equalTo("20"))
+            .body("DescribeVolumesResponse.volumeSet.item.status", equalTo("available"));
+    }
+
+    @Test
+    @Order(95)
+    void describeVolumesByStatusFilter() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("Filter.1.Name", "status")
+            .formParam("Filter.1.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.status", equalTo("available"));
+    }
+
+    @Test
+    @Order(96)
+    void describeVolumesByVolumeTypeFilter() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("Filter.1.Name", "volume-type")
+            .formParam("Filter.1.Value.1", "gp2")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVolumesResponse.volumeSet.item.volumeType", equalTo("gp2"));
+    }
+
+    @Test
+    @Order(97)
+    void deleteVolume() {
+        given()
+            .formParam("Action", "DeleteVolume")
+            .formParam("VolumeId", volumeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DeleteVolumeResponse.return", equalTo("true"));
+    }
+
+    @Test
+    @Order(98)
+    void describeDeletedVolumeReturnsNotFound() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("VolumeId.1", volumeId)
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidVolume.NotFound"));
+    }
+
     // =========================================================================
     // Teardown / cleanup
     // =========================================================================
@@ -731,7 +928,7 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("TerminateInstancesResponse.instancesSet.item.instanceId", equalTo(instanceId))
-            .body("TerminateInstancesResponse.instancesSet.item.currentState.name", equalTo("terminated"));
+            .body("TerminateInstancesResponse.instancesSet.item.currentState.name", equalTo("shutting-down"));
     }
 
     @Test
@@ -895,6 +1092,20 @@ class Ec2IntegrationTest {
 
     @Test
     @Order(202)
+    void describeNonExistentVolume() {
+        given()
+            .formParam("Action", "DescribeVolumes")
+            .formParam("VolumeId.1", "vol-0000000000000dead")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidVolume.NotFound"));
+    }
+
+    @Test
+    @Order(203)
     void unsupportedAction() {
         given()
             .formParam("Action", "SomeUnknownAction")

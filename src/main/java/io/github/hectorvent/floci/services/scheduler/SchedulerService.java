@@ -128,6 +128,31 @@ public class SchedulerService {
         LOG.infov("Deleted schedule group: {0} (removed {1} schedules)", name, orphanKeys.size());
     }
 
+    public Map<String, String> getScheduleGroupTags(String name, String region) {
+        ScheduleGroup group = getScheduleGroup(name, region);
+        return Map.copyOf(group.getTags());
+    }
+
+    public void tagScheduleGroup(String name, String region, Map<String, String> tags) {
+        if (tags == null || tags.isEmpty()) {
+            return;
+        }
+        ScheduleGroup group = getScheduleGroup(name, region);
+        group.getTags().putAll(tags);
+        group.setLastModificationDate(Instant.now());
+        groupStore.put(groupKey(region, group.getName()), group);
+    }
+
+    public void untagScheduleGroup(String name, String region, List<String> tagKeys) {
+        if (tagKeys == null || tagKeys.isEmpty()) {
+            return;
+        }
+        ScheduleGroup group = getScheduleGroup(name, region);
+        tagKeys.forEach(group.getTags()::remove);
+        group.setLastModificationDate(Instant.now());
+        groupStore.put(groupKey(region, group.getName()), group);
+    }
+
     public List<ScheduleGroup> listScheduleGroups(String namePrefix, String region) {
         getOrCreateDefaultGroup(region);
         String storagePrefix = "group:" + region + ":";
@@ -229,6 +254,15 @@ public class SchedulerService {
                         "Schedule not found: " + name, 404));
         scheduleStore.delete(key);
         LOG.infov("Deleted schedule: {0} in group {1}", name, effectiveGroup);
+    }
+
+    /**
+     * Return every persisted schedule across all regions and groups. Used by
+     * {@link ScheduleDispatcher} to evaluate due schedules; other callers should
+     * prefer {@link #listSchedules}.
+     */
+    public List<Schedule> listAllSchedules() {
+        return scheduleStore.scan(k -> k.startsWith("schedule:"));
     }
 
     public List<Schedule> listSchedules(String groupName, String namePrefix, String state, String region) {

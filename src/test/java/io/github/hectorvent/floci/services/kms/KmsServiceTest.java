@@ -2,15 +2,25 @@ package io.github.hectorvent.floci.services.kms;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.security.Security;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,6 +29,13 @@ class KmsServiceTest {
     private static final String REGION = "us-east-1";
 
     private KmsService kmsService;
+
+    @BeforeAll
+    static void registerBouncyCastle() {
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+    }
 
     @BeforeEach
     void setUp() {
@@ -180,23 +197,48 @@ class KmsServiceTest {
                 kmsService.decrypt("not-valid-ciphertext".getBytes(StandardCharsets.UTF_8), REGION));
     }
 
-    @Test
-    void signAndVerify() {
-        KmsKey key = kmsService.createKey(null, REGION);
+    @ParameterizedTest
+    @ValueSource(strings = {"ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"})
+    void signAndVerify(String keySpec) {
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", keySpec, null, Map.of(), REGION);
         byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
 
-        byte[] sig = kmsService.sign(key.getKeyId(), message, "RSASSA_PSS_SHA_256", REGION);
-        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "RSASSA_PSS_SHA_256", REGION));
+        byte[] sig = kmsService.sign(key.getKeyId(), message, "ECDSA_SHA_256", REGION);
+        assertNotNull(sig);
+        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "ECDSA_SHA_256", REGION));
+    }
+
+    @Test
+    void signAndVerifyWithRsa() {
+        KmsKey key = kmsService.createKey("rsa key", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
+        byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
+
+        byte[] sig = kmsService.sign(key.getKeyId(), message, "RSASSA_PKCS1_V1_5_SHA_256", REGION);
+        assertNotNull(sig);
+        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "RSASSA_PKCS1_V1_5_SHA_256", REGION));
     }
 
     @Test
     void verifyWithWrongSignatureReturnsFalse() {
-        KmsKey key = kmsService.createKey(null, REGION);
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", "ECC_NIST_P256", null, Map.of(), REGION);
         byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
 
-        kmsService.sign(key.getKeyId(), message, "RSASSA_PSS_SHA_256", REGION);
         assertFalse(kmsService.verify(key.getKeyId(), message,
-                "wrong-sig".getBytes(StandardCharsets.UTF_8), "RSASSA_PSS_SHA_256", REGION));
+                "not-a-valid-sig".getBytes(StandardCharsets.UTF_8), "ECDSA_SHA_256", REGION));
+    }
+
+    @Test
+    void getPublicKeyReturnsValidDerBytes() throws Exception {
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", "ECC_NIST_P256", null, Map.of(), REGION);
+        KmsKey publicKeyInfo = kmsService.getPublicKey(key.getKeyId(), REGION);
+
+        assertNotNull(publicKeyInfo.getPublicKeyEncoded());
+        byte[] derBytes = Base64.getDecoder().decode(publicKeyInfo.getPublicKeyEncoded());
+        
+        // Verify it can be parsed as a standard Java PublicKey
+        KeyFactory factory = KeyFactory.getInstance("EC");
+        PublicKey pub = factory.generatePublic(new X509EncodedKeySpec(derBytes));
+        assertNotNull(pub);
     }
 
     @Test
@@ -245,6 +287,67 @@ class KmsServiceTest {
     void createKeyWithoutTagsHasEmptyTagMap() {
         KmsKey key = kmsService.createKey(null, REGION);
         assertTrue(key.getTags().isEmpty());
+    }
+
+    @Test
+    void createKeyWithOverrideIdUsesProvidedId() {
+        KmsKey key = kmsService.createKey(
+                "tagged-key",
+                null,
+                Map.of(ReservedTags.OVERRIDE_ID_KEY, "my-test-key"),
+                REGION
+        );
+
+        assertEquals("my-test-key", key.getKeyId());
+        assertEquals("arn:aws:kms:us-east-1:000000000000:key/my-test-key", key.getArn());
+    }
+
+    @Test
+    void createKeyWithOverrideIdStripsReservedTagFromStoredKey() {
+        KmsKey key = kmsService.createKey(
+                "tagged-key",
+                null,
+                Map.of(ReservedTags.OVERRIDE_ID_KEY, "my-test-key", "env", "test"),
+                REGION
+        );
+
+        KmsKey found = kmsService.describeKey(key.getKeyId(), REGION);
+        assertEquals("test", found.getTags().get("env"));
+        assertFalse(found.getTags().containsKey(ReservedTags.OVERRIDE_ID_KEY));
+    }
+
+    @Test
+    void createKeyWithDuplicateOverrideIdThrowsAlreadyExists() {
+        kmsService.createKey("first", null, Map.of(ReservedTags.OVERRIDE_ID_KEY, "my-test-key"), REGION);
+
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> kmsService.createKey("second", null, Map.of(ReservedTags.OVERRIDE_ID_KEY, "my-test-key"), REGION)
+        );
+
+        assertEquals("AlreadyExistsException", exception.getErrorCode());
+    }
+
+    @Test
+    void createKeyWithBlankOverrideIdThrowsValidation() {
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> kmsService.createKey("bad", null, Map.of(ReservedTags.OVERRIDE_ID_KEY, "   "), REGION)
+        );
+
+        assertEquals("ValidationException", exception.getErrorCode());
+    }
+
+    @Test
+    void tagResourceWithReservedKeyThrowsValidation() {
+        KmsKey key = kmsService.createKey(null, REGION);
+
+        AwsException exception = assertThrows(
+                AwsException.class,
+                () -> kmsService.tagResource(key.getKeyId(), Map.of(ReservedTags.OVERRIDE_ID_KEY, "late-id"), REGION)
+        );
+
+        assertEquals("ValidationException", exception.getErrorCode());
     }
 
     // ── Issue #258 — GetKeyPolicy ────────────────────────────────────────────
@@ -318,12 +421,73 @@ class KmsServiceTest {
     }
 
     @Test
-    void keyRotationOnAsymmetricKeyThrows() {
+    void enableKeyRotationOnAsymmetricKeyThrows() {
         KmsKey key = kmsService.createKey(null, REGION);
         key.setCustomerMasterKeySpec("RSA_2048");
         key.setKeyUsage("SIGN_VERIFY");
-        // Persist the modified key
         assertThrows(AwsException.class, () ->
                 kmsService.enableKeyRotation(key.getKeyId(), REGION));
+    }
+
+    @Test
+    void getKeyRotationStatusOnAsymmetricKeyReturnsFalse() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        key.setCustomerMasterKeySpec("ECC_NIST_P256");
+        key.setKeyUsage("SIGN_VERIFY");
+        assertFalse(kmsService.getKeyRotationStatus(key.getKeyId(), REGION));
+    }
+
+    @Test
+    void getKeyRotationStatusOnHmacKeyReturnsFalse() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        key.setCustomerMasterKeySpec("HMAC_256");
+        key.setKeyUsage("GENERATE_VERIFY_MAC");
+        assertFalse(kmsService.getKeyRotationStatus(key.getKeyId(), REGION));
+    }
+
+    // ── Issue #497 — HMAC key specs ─────────────────────────────────────────
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HMAC_224", "HMAC_256", "HMAC_384", "HMAC_512"})
+    void createHmacKey_allSpecs(String spec) {
+        KmsKey key = kmsService.createKey("hmac key", "GENERATE_VERIFY_MAC", spec, null, Map.of(), REGION);
+
+        assertEquals(spec, key.getCustomerMasterKeySpec());
+        assertEquals("GENERATE_VERIFY_MAC", key.getKeyUsage());
+        assertNotNull(key.getPrivateKeyEncoded());
+
+        int expectedBytes = switch (spec) {
+            case "HMAC_224" -> 28;
+            case "HMAC_256" -> 32;
+            case "HMAC_384" -> 48;
+            case "HMAC_512" -> 64;
+            default -> -1;
+        };
+        assertEquals(expectedBytes, Base64.getDecoder().decode(key.getPrivateKeyEncoded()).length);
+
+        KmsKey found = kmsService.describeKey(key.getKeyId(), REGION);
+        assertEquals(spec, found.getCustomerMasterKeySpec());
+    }
+
+    @Test
+    void createHmacKey_requiresGenerateVerifyMacUsage() {
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.createKey("hmac key", "ENCRYPT_DECRYPT", "HMAC_256", null, Map.of(), REGION));
+        assertEquals("ValidationException", ex.getErrorCode());
+    }
+
+    @Test
+    void createSymmetricKey_rejectsGenerateVerifyMacUsage() {
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.createKey("bad", "GENERATE_VERIFY_MAC", "SYMMETRIC_DEFAULT", null, Map.of(), REGION));
+        assertEquals("ValidationException", ex.getErrorCode());
+    }
+
+    @Test
+    void getPublicKeyForHmacKey_throwsUnsupportedOperation() {
+        KmsKey key = kmsService.createKey("hmac key", "GENERATE_VERIFY_MAC", "HMAC_256", null, Map.of(), REGION);
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.getPublicKey(key.getKeyId(), REGION));
+        assertEquals("UnsupportedOperationException", ex.getErrorCode());
     }
 }
