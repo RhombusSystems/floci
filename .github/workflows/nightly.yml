@@ -1,8 +1,15 @@
 name: Nightly
 
 # Builds and publishes native images from the tip of main as nightly Docker tags.
-# Runs every night at 22:00 CT (03:00 UTC, approximate — shifts 1 h in CST winter).
-# Can also be triggered manually.
+#
+# DISABLED on the RhombusSystems fork: this workflow pushes to the upstream
+# `floci/floci` Docker Hub repo, which only upstream maintainers can
+# authenticate to (requires DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets we
+# don't hold). The fork publishes its own image to ghcr.io via
+# publish-ghcr.yml, which is what rhombus-dev-sandbox consumes.
+#
+# Left in place (manual dispatch only) so future merges from upstream apply
+# cleanly without conflicts.
 #
 # Published tags:
 #   Native:  floci/floci:nightly   floci/floci:nightly-mmddyyyy
@@ -11,9 +18,7 @@ name: Nightly
 # Required secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
 
 on:
-  schedule:
-    - cron: '0 4 * * *'   # 23:00 CT (CDT/UTC-5); shifts to 23:00 CST in winter
-  workflow_dispatch:        # Allow maintainers to trigger manually
+  workflow_dispatch:        # Manual only — schedule disabled on this fork
 
 permissions:
   contents: read
