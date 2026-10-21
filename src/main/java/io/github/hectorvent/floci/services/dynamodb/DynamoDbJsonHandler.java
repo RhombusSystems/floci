@@ -233,33 +233,12 @@ public class DynamoDbJsonHandler {
         JsonNode exprAttrValues = request.has("ExpressionAttributeValues")
                 ? request.get("ExpressionAttributeValues") : null;
 
-        // Convert legacy Expected to ConditionExpression
         if (conditionExpression == null && request.has("Expected")) {
-            JsonNode expected = request.get("Expected");
-            StringBuilder condBuilder = new StringBuilder();
-            int idx = 0;
-            var fields = expected.fields();
-            while (fields.hasNext()) {
-                var entry = fields.next();
-                String attrName = entry.getKey();
-                JsonNode condition = entry.getValue();
-                if (idx > 0) condBuilder.append(" AND ");
-                if (condition.has("Exists") && !condition.get("Exists").asBoolean()) {
-                    condBuilder.append("attribute_not_exists(").append(attrName).append(")");
-                } else if (condition.has("ComparisonOperator")) {
-                    // NOT_NULL, NULL, etc
-                    String op = condition.get("ComparisonOperator").asText();
-                    if ("NOT_NULL".equals(op)) condBuilder.append("attribute_exists(").append(attrName).append(")");
-                    else if ("NULL".equals(op)) condBuilder.append("attribute_not_exists(").append(attrName).append(")");
-                } else if (condition.has("Value")) {
-                    String placeholder = ":_expected" + idx;
-                    condBuilder.append(attrName).append(" = ").append(placeholder);
-                    if (exprAttrValues == null) exprAttrValues = objectMapper.createObjectNode();
-                    ((ObjectNode) exprAttrValues).set(placeholder, condition.get("Value"));
-                }
-                idx++;
-            }
-            if (condBuilder.length() > 0) conditionExpression = condBuilder.toString();
+            ObjectNode names = mutableCopy(exprAttrNames);
+            ObjectNode values = mutableCopy(exprAttrValues);
+            conditionExpression = legacyExpectedToCondition(request, names, values);
+            exprAttrNames = names;
+            exprAttrValues = values;
         }
 
         JsonNode oldItem = null;
@@ -304,6 +283,14 @@ public class DynamoDbJsonHandler {
         JsonNode exprAttrValues = request.has("ExpressionAttributeValues")
                 ? request.get("ExpressionAttributeValues") : null;
 
+        if (conditionExpression == null && request.has("Expected")) {
+            ObjectNode names = mutableCopy(exprAttrNames);
+            ObjectNode values = mutableCopy(exprAttrValues);
+            conditionExpression = legacyExpectedToCondition(request, names, values);
+            exprAttrNames = names;
+            exprAttrValues = values;
+        }
+
         JsonNode oldItem = dynamoDbService.deleteItem(tableName, key, conditionExpression,
                 exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure);
 
@@ -328,40 +315,12 @@ public class DynamoDbJsonHandler {
         String conditionExpression = request.has("ConditionExpression")
                 ? request.get("ConditionExpression").asText() : null;
 
-        // Convert legacy Expected to ConditionExpression if present
         if (conditionExpression == null && request.has("Expected")) {
-            JsonNode expected = request.get("Expected");
-            StringBuilder condBuilder = new StringBuilder();
-            ObjectNode syntheticAttrValues = objectMapper.createObjectNode();
-            int idx = 0;
-            var fields = expected.fields();
-            while (fields.hasNext()) {
-                var entry = fields.next();
-                String attrName = entry.getKey();
-                JsonNode condition = entry.getValue();
-                if (idx > 0) condBuilder.append(" AND ");
-                if (condition.has("Exists") && !condition.get("Exists").asBoolean()) {
-                    condBuilder.append("attribute_not_exists(").append(attrName).append(")");
-                } else if (condition.has("Value")) {
-                    String placeholder = ":_expected" + idx;
-                    condBuilder.append(attrName).append(" = ").append(placeholder);
-                    syntheticAttrValues.set(placeholder, condition.get("Value"));
-                }
-                idx++;
-            }
-            if (condBuilder.length() > 0) {
-                conditionExpression = condBuilder.toString();
-                if (exprAttrValues == null) {
-                    exprAttrValues = syntheticAttrValues;
-                } else {
-                    // merge
-                    var mergedFields = syntheticAttrValues.fields();
-                    while (mergedFields.hasNext()) {
-                        var e = mergedFields.next();
-                        ((ObjectNode) exprAttrValues).set(e.getKey(), e.getValue());
-                    }
-                }
-            }
+            ObjectNode names = mutableCopy(exprAttrNames);
+            ObjectNode values = mutableCopy(exprAttrValues);
+            conditionExpression = legacyExpectedToCondition(request, names, values);
+            exprAttrNames = names;
+            exprAttrValues = values;
         }
 
         String returnValues = request.path("ReturnValues").asText("NONE");
@@ -389,6 +348,83 @@ public class DynamoDbJsonHandler {
         }
         addConsumedCapacity(response, request, tableName, 1, true);
         return Response.ok(response).build();
+    }
+
+    private ObjectNode mutableCopy(JsonNode node) {
+        return node instanceof ObjectNode o ? o.deepCopy() : objectMapper.createObjectNode();
+    }
+
+    /**
+     * Names and values go into {@code names} and {@code values} as {@code #_eN} and {@code :_eN_K}
+     * placeholders, so attribute names that are reserved words still parse.
+     */
+    private String legacyExpectedToCondition(JsonNode request, ObjectNode names, ObjectNode values) {
+        JsonNode expected = request.path("Expected");
+        if (!expected.isObject() || expected.isEmpty()) {
+            return null;
+        }
+        String joiner = "OR".equals(request.path("ConditionalOperator").asText("AND")) ? " OR " : " AND ";
+        List<String> clauses = new ArrayList<>();
+        int i = 0;
+        for (Iterator<Map.Entry<String, JsonNode>> it = expected.fields(); it.hasNext(); i++) {
+            Map.Entry<String, JsonNode> entry = it.next();
+            String name = "#_e" + i;
+            names.put(name, entry.getKey());
+            JsonNode cond = entry.getValue();
+            List<String> refs = new ArrayList<>();
+            String op;
+            if (cond.has("ComparisonOperator")) {
+                op = cond.get("ComparisonOperator").asText();
+                JsonNode list = cond.path("AttributeValueList");
+                for (int k = 0; k < list.size(); k++) {
+                    String ref = ":_e" + i + "_" + k;
+                    values.set(ref, list.get(k));
+                    refs.add(ref);
+                }
+            } else if (cond.has("Value") && cond.path("Exists").asBoolean(true)) {
+                op = "EQ";
+                values.set(":_e" + i + "_0", cond.get("Value"));
+                refs.add(":_e" + i + "_0");
+            } else if (!cond.path("Exists").asBoolean(true)) {
+                op = "NULL";
+            } else {
+                throw new AwsException("ValidationException",
+                        "One or more parameter values were invalid: Value must be provided when Exists is true for Attribute: "
+                                + entry.getKey(), 400);
+            }
+            int arity = switch (op) {
+                case "NULL", "NOT_NULL" -> 0;
+                case "BETWEEN" -> 2;
+                case "IN" -> -1;
+                default -> 1;
+            };
+            if (arity >= 0 ? refs.size() != arity : refs.isEmpty()) {
+                throw new AwsException("ValidationException",
+                        "One or more parameter values were invalid: Invalid number of argument(s) for the "
+                                + op + " ComparisonOperator", 400);
+            }
+            String v0 = refs.isEmpty() ? null : refs.get(0);
+            clauses.add(switch (op) {
+                case "EQ" -> name + " = " + v0;
+                case "NE" -> name + " <> " + v0;
+                case "LT" -> name + " < " + v0;
+                case "LE" -> name + " <= " + v0;
+                case "GT" -> name + " > " + v0;
+                case "GE" -> name + " >= " + v0;
+                case "NOT_NULL" -> "attribute_exists(" + name + ")";
+                case "NULL" -> "attribute_not_exists(" + name + ")";
+                case "CONTAINS" -> "contains(" + name + ", " + v0 + ")";
+                case "NOT_CONTAINS" -> "NOT contains(" + name + ", " + v0 + ")";
+                case "BEGINS_WITH" -> "begins_with(" + name + ", " + v0 + ")";
+                case "BETWEEN" -> name + " BETWEEN " + v0 + " AND " + refs.get(1);
+                case "IN" -> name + " IN (" + String.join(", ", refs) + ")";
+                default -> throw new AwsException("ValidationException",
+                        "Unsupported ComparisonOperator in Expected: " + op, 400);
+            });
+        }
+        StringJoiner out = new StringJoiner(joiner);
+        clauses.forEach(c -> out.add("(" + c + ")"));
+        return out.toString();
     }
 
     private JsonNode getChangedAttributes(JsonNode preferredItem, JsonNode secondaryItem){

@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -291,5 +293,114 @@ class DynamoDbJsonHandlerTest {
 
         assertNotNull(responseData);
         assertFalse(responseData.has("Attributes"), "Attributes property must not be present");
+    }
+
+    private void createGroupsTable() {
+        service.createTable("Groups",
+                List.of(new KeySchemaElement("orgUuid", "HASH"), new KeySchemaElement("uuid", "RANGE")),
+                List.of(new AttributeDefinition("orgUuid", "S"), new AttributeDefinition("uuid", "S")),
+                5L, 5L);
+    }
+
+    private JsonNode json(String text) throws Exception {
+        return mapper.readTree(text);
+    }
+
+    // What the AWS SDK v1 document API sends for UpdateItemSpec.withExpected(new Expected("orgUuid").exists(),
+    // new Expected("uuid").exists()) plus a PUT AttributeUpdate.
+    private JsonNode legacyRename(String uuid, String name) throws Exception {
+        return json("""
+                {"TableName": "Groups",
+                 "Key": {"orgUuid": {"S": "o1"}, "uuid": {"S": "%s"}},
+                 "AttributeUpdates": {"name": {"Action": "PUT", "Value": {"S": "%s"}}},
+                 "Expected": {"orgUuid": {"ComparisonOperator": "NOT_NULL"},
+                              "uuid": {"ComparisonOperator": "NOT_NULL"}},
+                 "ReturnValues": "ALL_NEW"}
+                """.formatted(uuid, name));
+    }
+
+    @Test
+    void updateItemWithTwoLegacyNotNullConditionsUpdatesTheExistingItem() throws Exception {
+        createGroupsTable();
+        service.putItem("Groups", item("orgUuid", "o1", "uuid", "g1", "name", "old"));
+
+        Response response = handler.handle("UpdateItem", legacyRename("g1", "new"), "us-east-1");
+
+        JsonNode attributes = mapper.convertValue(response.getEntity(), JsonNode.class).get("Attributes");
+        assertEquals("new", attributes.get("name").get("S").asText());
+    }
+
+    @Test
+    void updateItemWithLegacyNotNullOnAMissingItemFailsAndCreatesNothing() throws Exception {
+        createGroupsTable();
+
+        assertThrows(ConditionalCheckFailedException.class,
+                () -> handler.handle("UpdateItem", legacyRename("missing", "new"), "us-east-1"));
+
+        assertNull(service.getItem("Groups", item("orgUuid", "o1", "uuid", "missing")));
+    }
+
+    @Test
+    void putItemEnforcesALegacyEqCondition() throws Exception {
+        createGroupsTable();
+        service.putItem("Groups", item("orgUuid", "o1", "uuid", "g1", "name", "old"));
+        JsonNode request = json("""
+                {"TableName": "Groups",
+                 "Item": {"orgUuid": {"S": "o1"}, "uuid": {"S": "g1"}, "name": {"S": "new"}},
+                 "Expected": {"name": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "other"}]}}}
+                """);
+
+        assertThrows(ConditionalCheckFailedException.class, () -> handler.handle("PutItem", request, "us-east-1"));
+
+        assertEquals("old", service.getItem("Groups", item("orgUuid", "o1", "uuid", "g1")).get("name").get("S").asText());
+    }
+
+    @Test
+    void deleteItemEnforcesLegacyExpected() throws Exception {
+        createGroupsTable();
+        service.putItem("Groups", item("orgUuid", "o1", "uuid", "g1", "name", "old"));
+        JsonNode request = json("""
+                {"TableName": "Groups",
+                 "Key": {"orgUuid": {"S": "o1"}, "uuid": {"S": "g1"}},
+                 "Expected": {"name": {"Value": {"S": "other"}}}}
+                """);
+
+        assertThrows(ConditionalCheckFailedException.class, () -> handler.handle("DeleteItem", request, "us-east-1"));
+
+        assertNotNull(service.getItem("Groups", item("orgUuid", "o1", "uuid", "g1")));
+    }
+
+    @Test
+    void legacyConditionalOperatorOrPassesWhenOneConditionHolds() throws Exception {
+        createGroupsTable();
+        service.putItem("Groups", item("orgUuid", "o1", "uuid", "g1", "name", "old"));
+        JsonNode request = json("""
+                {"TableName": "Groups",
+                 "Key": {"orgUuid": {"S": "o1"}, "uuid": {"S": "g1"}},
+                 "AttributeUpdates": {"name": {"Action": "PUT", "Value": {"S": "new"}}},
+                 "Expected": {"name": {"Value": {"S": "old"}}, "missing": {"Exists": false},
+                              "size": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}},
+                 "ConditionalOperator": "OR"}
+                """);
+
+        handler.handle("UpdateItem", request, "us-east-1");
+
+        assertEquals("new", service.getItem("Groups", item("orgUuid", "o1", "uuid", "g1")).get("name").get("S").asText());
+    }
+
+    @Test
+    void legacyBetweenWithOneValueIsAValidationError() throws Exception {
+        createGroupsTable();
+        JsonNode request = json("""
+                {"TableName": "Groups",
+                 "Key": {"orgUuid": {"S": "o1"}, "uuid": {"S": "g1"}},
+                 "AttributeUpdates": {"name": {"Action": "PUT", "Value": {"S": "new"}}},
+                 "Expected": {"name": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"S": "a"}]}}}
+                """);
+
+        AwsException e = assertThrows(AwsException.class, () -> handler.handle("UpdateItem", request, "us-east-1"));
+
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
     }
 }
